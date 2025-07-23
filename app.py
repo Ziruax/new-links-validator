@@ -72,7 +72,7 @@ UNNAMED_GROUP_PLACEHOLDER = ""  # Changed to empty string
 IMAGE_PATTERN_PPS = re.compile(r'https:\/\/pps\.whatsapp\.net\/v\/t\d+\/[-\w]+\/\d+\.jpg\?')
 OG_IMAGE_PATTERN = re.compile(r'https?:\/\/[^\/\s]+\/[^\/\s]+\.(jpg|jpeg|png)(\?[^\s]*)?')
 MAX_VALIDATION_WORKERS = 8
-MAX_SCRAPING_WORKERS = 5 # New: For concurrent scraping tasks
+MAX_SCRAPING_WORKERS = 5 # New: For concurrent scraping tasks (Google, Bulk URLs, internal crawl scraping)
 # --- Custom CSS ---
 st.markdown("""
 <style>
@@ -137,6 +137,7 @@ def load_keywords_from_excel(uploaded_file):
         return []
 
 def load_links_from_file(uploaded_file):
+    """Loads links from TXT/CSV files for validation or bulk scraping."""
     if uploaded_file is None: return []
     try:
         content = uploaded_file.getvalue()
@@ -153,11 +154,12 @@ def load_links_from_file(uploaded_file):
             try:
                 df = pd.read_csv(io.StringIO(text_content))
                 if df.empty: st.warning("CSV file is empty."); return []
+                # Assume links are in the first column
                 return [link.strip() for link in df.iloc[:, 0].dropna().astype(str).tolist() if link.strip().startswith(('http://', 'https://'))]
             except Exception as e:
                 st.error(f"Error reading CSV: {e}.", icon="❌"); return []
-        else: # Assume TXT
-            return [line.strip() for line in text_content.splitlines() if line.strip()]
+        else: # Assume TXT - one link per line
+            return [line.strip() for line in text_content.splitlines() if line.strip().startswith(('http://', 'https://'))]
     except Exception as e:
         st.error(f"Error processing file {uploaded_file.name}: {e}", icon="❌"); return []
 
@@ -225,7 +227,7 @@ def validate_link(link):
     return result
 
 def scrape_whatsapp_links_from_page(url, session=None):
-    """Scrapes a single page for WhatsApp links."""
+    """Scrapes a single page for WhatsApp links. Used by various scrapers."""
     links = set()
     try:
         headers = get_random_headers_general()
@@ -233,19 +235,21 @@ def scrape_whatsapp_links_from_page(url, session=None):
         response.encoding = 'utf-8'
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
+        # Method 1: Find <a> tags with href
         for a_tag in soup.find_all('a', href=True):
             href = a_tag.get('href')
             if href and href.startswith(WHATSAPP_DOMAIN):
                 parsed_url = urlparse(href)
                 links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
+        # Method 2: Search text content for potential links
         text_content = soup.get_text()
         if WHATSAPP_DOMAIN in text_content:
             for link_url in re.findall(r'(https?://chat\.whatsapp\.com/[^\s"\'<>()\[\]{}]+)', text_content):
                 clean_link = re.sub(r'[.,;!?"\'<>)]+$', '', link_url)
                 clean_link = re.sub(r'(\.[a-zA-Z]{2,4})$', '', clean_link) if not clean_link.endswith(('.html', '.htm', '.php')) else clean_link
-                clean_link = clean_link.split('&')[0] 
+                clean_link = clean_link.split('&')[0] # Often query params are not needed for WA links
                 parsed_url = urlparse(clean_link)
-                if len(parsed_url.path.replace('/', '')) > 15:
+                if len(parsed_url.path.replace('/', '')) > 15: # Basic sanity check for WA invite ID
                     links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
     except requests.exceptions.Timeout: st.sidebar.warning(f"Scrape Timeout: {url[:50]}...", icon="⏱️")
     except requests.exceptions.HTTPError as e: st.sidebar.warning(f"Scrape HTTP Err {e.response.status_code}: {url[:50]}...", icon="⚠️")
@@ -253,6 +257,7 @@ def scrape_whatsapp_links_from_page(url, session=None):
     except Exception as e: st.sidebar.warning(f"Scrape Parse Err ({type(e).__name__}): {url[:50]}...", icon="💣")
     return list(links)
 
+# --- Google Search Scraper (Updated for concurrency) ---
 def scrape_single_google_result_page(url_from_google):
     """Wrapper for scraping a single Google result page, used by ThreadPoolExecutor."""
     try:
@@ -313,6 +318,56 @@ def google_search_and_scrape(query, top_n=5):
     except Exception as e:
         st.error(f"Unexpected Google search/scrape error for '{query}': {e}. Check connection/library.", icon="❌")
         return []
+
+# --- Bulk URL Scraper ---
+def scrape_single_bulk_url(url):
+    """Wrapper for scraping a single URL from the bulk list, used by ThreadPoolExecutor."""
+    try:
+        # Each thread gets its own session for connection pooling within that thread
+        with requests.Session() as session:
+            wa_links_from_page = scrape_whatsapp_links_from_page(url, session=session)
+            return url, wa_links_from_page
+    except Exception as e:
+        st.sidebar.warning(f"Bulk Scrape Error for {url[:50]}: {e}", icon="🔗")
+        return url, []
+
+def scrape_bulk_urls(list_of_urls):
+    """Scrapes a list of URLs concurrently."""
+    if not list_of_urls:
+        st.warning("No URLs provided for bulk scraping.")
+        return set()
+    st.info(f"Starting bulk scrape of {len(list_of_urls)} URLs...")
+    all_scraped_wa_links = set()
+    
+    prog_bar, stat_txt = st.progress(0), st.empty()
+    successfully_processed = 0
+
+    # Concurrently scrape the URLs
+    with ThreadPoolExecutor(max_workers=MAX_SCRAPING_WORKERS) as executor:
+        # Submit all scraping tasks
+        future_to_url = {executor.submit(scrape_single_bulk_url, url): url for url in list_of_urls if url.startswith(('http://', 'https://'))}
+        
+        # Process completed tasks as they finish
+        for i, future in enumerate(as_completed(future_to_url)):
+            url_scraped = future_to_url[future]
+            try:
+                url_processed, wa_links_from_page = future.result()
+                newly_found_count = 0
+                for link in wa_links_from_page:
+                    if link.startswith(WHATSAPP_DOMAIN) and link not in all_scraped_wa_links:
+                        all_scraped_wa_links.add(link)
+                        newly_found_count += 1
+                if newly_found_count > 0:
+                    st.sidebar.info(f"Bulk: Found {newly_found_count} new WA links on {url_scraped[:30]}...")
+                successfully_processed += 1
+            except Exception as e:
+                 st.sidebar.warning(f"Error bulk scraping {url_scraped[:50]}: {e}", icon="⚠️")
+            
+            prog_bar.progress((i + 1) / len(future_to_url)) # Use len(future_to_url) in case some URLs were filtered
+            stat_txt.text(f"Bulk Processed {successfully_processed}/{len(future_to_url)} URLs...")
+
+    stat_txt.success(f"Bulk scraping complete. Found {len(all_scraped_wa_links)} unique WhatsApp links from {len(future_to_url)} URLs.")
+    return all_scraped_wa_links
 
 # --- Crawler Logic ---
 # Define a thread-safe data structure for the crawler's shared state
@@ -629,11 +684,12 @@ def main():
         st.header("⚙️ Input & Settings")
         input_method = st.selectbox("Choose Input Method:", [
             "Search and Scrape from Google", "Search & Scrape from Google (Bulk via Excel)",
-            "Scrape from Specific Webpage URL", "Scrape from Entire Website (Extensive Crawl)",
-            "Enter Links Manually (for Validation)", "Upload Link File (TXT/CSV/Excel)"
+            "Scrape from Specific Webpage URL", "Scrape from Bulk Specific URLs (TXT/CSV/Excel)",
+            "Scrape from Entire Website (Extensive Crawl)",
+            "Enter Links Manually (for Validation)", "Upload Link File (TXT/CSV/Excel - Validation)"
         ], key="input_method_main_select")
         gs_top_n = 5
-        if input_method in ["Search and Scrape from Google", "Search & Scrape from Google (Bulk via Excel)", "Upload Link File (TXT/CSV/Excel)"]:
+        if input_method in ["Search and Scrape from Google", "Search & Scrape from Google (Bulk via Excel)", "Upload Link File (TXT/CSV/Excel - Validation)"]:
             gs_top_n = st.slider("Google Results to Scrape (per keyword)", 1, 20, 5, key="gs_top_n_slider", help="Number of Google search result pages to analyze per keyword.")
         
         # --- Updated Crawl Settings UI ---
@@ -705,6 +761,28 @@ def main():
                         current_action_scraped_links.update(scrape_whatsapp_links_from_page(url))
                     st.success(f"Scraping done. Found {len(current_action_scraped_links)} links.")
                 else: st.warning("Please enter a valid URL.")
+        # --- New Bulk URL Scraping Feature ---
+        elif input_method == "Scrape from Bulk Specific URLs (TXT/CSV/Excel)":
+             file = st.file_uploader("Upload TXT/CSV/Excel (containing URLs to scrape)", type=["txt", "csv", "xlsx"], key="bulk_urls_file_uploader")
+             if file and st.button("Process Bulk URLs & Validate", use_container_width=True, key="bulk_urls_button"):
+                urls_to_scrape = load_links_from_file(file) # Reuse the function, it handles TXT/CSV now
+                if file.name.endswith('.xlsx'):
+                    # Special handling for Excel: assume first column contains URLs
+                    try:
+                        df_excel = pd.read_excel(io.BytesIO(file.getvalue()), engine='openpyxl')
+                        if df_excel.empty: st.warning("Excel file is empty."); urls_to_scrape = []
+                        else:
+                            urls_to_scrape = [url.strip() for url in df_excel.iloc[:, 0].dropna().astype(str).tolist() if url.strip().startswith(('http://', 'https://'))]
+                            if not urls_to_scrape: st.warning("No valid URLs found in the first column of the Excel file.")
+                    except Exception as e_excel:
+                        st.error(f"Error reading Excel for URLs: {e_excel}", icon="❌")
+                        urls_to_scrape = []
+
+                if urls_to_scrape:
+                    st.info(f"Loaded {len(urls_to_scrape)} URLs. Starting concurrent scrape...")
+                    current_action_scraped_links.update(scrape_bulk_urls(urls_to_scrape))
+                else:
+                    st.warning("No valid URLs found in the uploaded file.")
         elif input_method == "Scrape from Entire Website (Extensive Crawl)":
             domain = st.text_input("Base Domain URL:", placeholder="example.com", key="crawl_domain_input")
             if st.button("Crawl & Scrape", use_container_width=True, key="crawl_button"):
@@ -722,9 +800,9 @@ def main():
                     if len(valid_links) < len(links): st.warning(f"Skipped {len(links)-len(valid_links)} non-WhatsApp links.")
                     current_action_scraped_links.update(valid_links)
                 else: st.warning("Please enter links.")
-        elif input_method == "Upload Link File (TXT/CSV/Excel)":
-            file = st.file_uploader("Upload TXT, CSV (links) or Excel (keywords)", type=["txt", "csv", "xlsx"], key="upload_file_input")
-            if file and st.button("Process File", use_container_width=True, key="upload_process_button"):
+        elif input_method == "Upload Link File (TXT/CSV/Excel - Validation)":
+            file = st.file_uploader("Upload TXT, CSV (links) or Excel (keywords)", type=["txt", "csv", "xlsx"], key="upload_file_input_validation")
+            if file and st.button("Process File for Validation", use_container_width=True, key="upload_process_button_validation"):
                 if file.name.endswith('.xlsx'):
                     st.info("Loading keywords from Excel for Google search...")
                     keywords = load_keywords_from_excel(file)

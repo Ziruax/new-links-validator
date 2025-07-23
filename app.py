@@ -366,7 +366,8 @@ def crawler_worker(thread_id, url_queue, state, base_domain, max_depth, session_
         except Empty:
             continue # Check stop_event again
 
-        if depth > max_depth:
+        # Check depth limit if it's set (not None)
+        if max_depth is not None and depth > max_depth:
             url_queue.task_done()
             continue
 
@@ -414,7 +415,8 @@ def crawler_worker(thread_id, url_queue, state, base_domain, max_depth, session_
                     st.sidebar.info(f"T{thread_id}: Found {newly_found_count} new WA links on {current_url[:30]}...")
 
                 # --- Discover new links to crawl (if within depth limit) ---
-                if depth < max_depth:
+                # Only discover new links if depth limit is not reached (or if it's unlimited)
+                if max_depth is None or depth < max_depth:
                     soup = BeautifulSoup(response.text, 'html.parser')
                     for link_tag in soup.find_all('a', href=True):
                         href = link_tag.get('href')
@@ -440,15 +442,30 @@ def crawler_worker(thread_id, url_queue, state, base_domain, max_depth, session_
         finally:
             url_queue.task_done()
 
-def crawl_website(start_url, max_depth=2, max_pages=50):
-    """Crawls a website concurrently using multiple threads."""
+def crawl_website(start_url, max_depth=None, max_pages=1000000):
+    """Crawls a website concurrently using multiple threads.
+    Args:
+        start_url (str): The initial URL to start crawling from.
+        max_depth (int, optional): Maximum depth to crawl. If None, depth is unlimited.
+        max_pages (int, optional): Maximum number of pages to crawl. Defaults to 1000000 (effectively unlimited).
+    Returns:
+        set: A set of unique WhatsApp links found during the crawl.
+    """
     scraped_whatsapp_links = set()
-    if not start_url.strip(): return scraped_whatsapp_links
+    if not start_url.strip():
+        return scraped_whatsapp_links
     if not start_url.startswith(('http://', 'https://')):
-        start_url = 'https://' + start_url; st.sidebar.warning(f"Prepending 'https://': {start_url}", icon="🔗")
-    parsed_start_url = urlparse(start_url)
+        start_url = 'https://' + start_url
+        st.sidebar.warning(f"Prepending 'https://': {start_url}", icon="🔗")
+    try:
+        parsed_start_url = urlparse(start_url)
+    except Exception as pe:
+        st.sidebar.error(f"Invalid start URL format: {start_url} - {pe}", icon="🚫")
+        return scraped_whatsapp_links
+
     if not parsed_start_url.netloc:
-        st.sidebar.error(f"Invalid start URL: {start_url}", icon="🚫"); return scraped_whatsapp_links
+        st.sidebar.error(f"Invalid start URL: {start_url}", icon="🚫")
+        return scraped_whatsapp_links
     base_domain = parsed_start_url.netloc.replace('www.', '')
 
     # Initialize thread-safe state
@@ -463,7 +480,6 @@ def crawl_website(start_url, max_depth=2, max_pages=50):
 
     # Progress tracking variables
     page_count = 0
-    max_q_size = max_pages * 10
     progress_lock = threading.Lock() # Lock for updating shared progress variables
 
     def progress_callback(thread_id, url, depth):
@@ -473,15 +489,22 @@ def crawl_website(start_url, max_depth=2, max_pages=50):
             current_page_count = page_count
             current_queue_size = url_queue.qsize()
         st.sidebar.text(f"T{thread_id} (D:{depth},P:{current_page_count},Q:{current_queue_size}): {url[:50]}...")
-        # Check stop conditions
-        if current_page_count >= max_pages or current_queue_size > max_q_size:
+        # Check stop conditions based on max_pages
+        if current_page_count >= max_pages:
              stop_event.set()
-             if current_queue_size > max_q_size:
-                st.sidebar.warning(f"Queue > {max_q_size}. Stopping.", icon="❗️")
+             st.sidebar.warning(f"Reached max pages limit ({max_pages}). Stopping crawl.", icon="🛑")
 
     # Session factory to create new sessions for threads
     def session_factory():
-        return requests.Session() # Each thread gets its own session instance
+        session = requests.Session()
+        # Optional: Add retry strategy for robustness
+        # from requests.adapters import HTTPAdapter
+        # from urllib3.util.retry import Retry
+        # retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        # adapter = HTTPAdapter(max_retries=retry_strategy)
+        # session.mount("http://", adapter)
+        # session.mount("https://", adapter)
+        return session
 
     # Create and start worker threads
     num_threads = min(MAX_SCRAPING_WORKERS, 4) # Limit crawler threads more conservatively
@@ -491,33 +514,50 @@ def crawl_website(start_url, max_depth=2, max_pages=50):
         t.start()
         threads.append(t)
         # Slight stagger start to avoid initial burst
-        time.sleep(0.1) 
+        time.sleep(0.05)
 
     # Wait for all tasks in the queue to be processed or stop event
     try:
+        # Main waiting loop while threads are working or items are in the queue
+        last_check_time = time.time()
         while not stop_event.is_set():
-            # Check if queue is empty and all threads are waiting
-            # This is a simple heuristic; a more robust way involves signaling.
-            time.sleep(0.5) 
-            if url_queue.empty():
-                # Give threads a moment to finish current tasks
-                time.sleep(1) 
+            # Check periodically if queue is empty and threads seem idle
+            time.sleep(1)
+            current_time = time.time()
+            # Check every few seconds
+            if current_time - last_check_time > 3:
                 if url_queue.empty():
-                     break # Likely done or stalled
-    except KeyboardInterrupt:
-        st.sidebar.error("Crawl interrupted by user.", icon="🛑")
-        stop_event.set()
+                    # Give threads a moment to finish current tasks or add new URLs
+                    time.sleep(1.5)
+                    if url_queue.empty():
+                         # Likely done or stalled
+                         break
+                last_check_time = current_time
 
-    # Wait for threads to finish (they should stop due to stop_event or empty queue)
+    except KeyboardInterrupt:
+        st.sidebar.error("Crawl interrupted by user (Ctrl+C).", icon="🛑")
+        stop_event.set()
+    except Exception as general_crawl_wait_error:
+         st.sidebar.error(f"Unexpected error during crawl wait: {general_crawl_wait_error}", icon="💥")
+         stop_event.set()
+
+    # Signal threads to stop if they haven't already
+    stop_event.set()
+
+    # Wait for threads to finish gracefully (with timeout)
     for t in threads:
         t.join(timeout=5) # Give them a timeout to finish
 
     # Get final results from the thread-safe state
     scraped_whatsapp_links = crawler_state.get_scraped_links()
 
-    st.sidebar.success(f"Crawl done. Scraped approx {page_count} pages, found {len(scraped_whatsapp_links)} links.")
-    if page_count >= max_pages: st.sidebar.warning(f"Stopped at {max_pages} pages.", icon="❗️")
-    if url_queue.qsize() > max_q_size: st.sidebar.warning(f"Queue capped at {max_q_size}.", icon="❗️")
+    final_msg = f"Crawl finished. Scraped approx {page_count} pages, found {len(scraped_whatsapp_links)} links."
+    if page_count >= max_pages:
+        final_msg += f" Stopped at {max_pages} pages limit."
+    if max_depth is not None:
+        final_msg += f" Max depth was {max_depth}."
+
+    st.sidebar.success(final_msg)
     return scraped_whatsapp_links
 
 # --- End of Crawler Logic ---
@@ -595,11 +635,34 @@ def main():
         gs_top_n = 5
         if input_method in ["Search and Scrape from Google", "Search & Scrape from Google (Bulk via Excel)", "Upload Link File (TXT/CSV/Excel)"]:
             gs_top_n = st.slider("Google Results to Scrape (per keyword)", 1, 20, 5, key="gs_top_n_slider", help="Number of Google search result pages to analyze per keyword.")
-        crawl_depth, crawl_pages = 2, 50
+        
+        # --- Updated Crawl Settings UI ---
+        crawl_depth, crawl_pages = None, 1000000 # Defaults for unlimited
         if input_method == "Scrape from Entire Website (Extensive Crawl)":
-            st.warning("⚠️ Extensive crawl can be slow. Use with caution.", icon="🚨")
-            crawl_depth = st.slider("Max Crawl Depth", 0, 5, 2, key="crawl_depth_slider")
-            crawl_pages = st.slider("Max Pages to Crawl", 1, 300, 50, key="crawl_pages_slider")
+            st.info("ℹ️ Default settings are now 'Unlimited Depth' and 'Unlimited Pages'. Adjust if needed.", icon="ℹ️")
+            # Use None or a specific int for depth. None means unlimited.
+            crawl_depth_option = st.radio(
+                "Crawl Depth Limit:",
+                options=["Unlimited Depth", "Set Depth Limit"],
+                index=0, # Default to Unlimited
+                key="crawl_depth_option_radio"
+            )
+            if crawl_depth_option == "Set Depth Limit":
+                crawl_depth = st.slider("Max Crawl Depth", 0, 10, 2, key="crawl_depth_slider")
+
+            # Use a very high default for pages, effectively unlimited unless changed.
+            crawl_pages_option = st.radio(
+                "Crawl Page Limit:",
+                options=["Unlimited Pages (Default)", "Set Page Limit"],
+                index=0, # Default to Unlimited
+                key="crawl_pages_option_radio"
+            )
+            if crawl_pages_option == "Set Page Limit":
+                crawl_pages = st.slider("Max Pages to Crawl", 1, 50000, 1000, step=100, key="crawl_pages_slider")
+
+            st.markdown("---")
+            st.warning("⚠️ Unlimited crawl can take a very long time and consume significant resources. Ensure the target site allows crawling. Consider setting limits.", icon="🚨")
+
         st.markdown("---")
         if st.button("🗑️ Clear All Results & Reset Filters", use_container_width=True, key="clear_all_button"):
             st.session_state.results, st.session_state.processed_links_in_session = [], set()

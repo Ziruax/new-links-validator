@@ -1,3 +1,5 @@
+# group_links_validator.py
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -10,7 +12,7 @@ from collections import deque
 import random
 from fake_useragent import UserAgent
 
-# Streamlit Configuration
+# --- Streamlit Configuration ---
 st.set_page_config(
     page_title="WhatsApp Link Validator",
     page_icon="🚀",
@@ -18,20 +20,20 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Constants
+# --- Constants ---
 WHATSAPP_DOMAIN = "https://chat.whatsapp.com/"
 IMAGE_PATTERN = re.compile(r'https:\/\/pps\.whatsapp\.net\/.*\.jpg\?[^&]*&[^&]+')
 GOOGLE_SEARCH_URL = "https://www.google.com/search"
 
-# Initialize UserAgent (handle potential errors in Streamlit Cloud)
+# --- Initialize User Agent ---
 try:
     ua = UserAgent()
-    USER_AGENT = ua.random
-except Exception as e:
-    # Fallback if fake-useragent fails (common in some cloud environments)
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 Edg/118.0.2088.46"
+    BASE_USER_AGENT = ua.random
+except Exception:
+    # Fallback User-Agent if fake-useragent fails
+    BASE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
 
-# Custom CSS for enhanced UI
+# --- Custom CSS for enhanced UI ---
 st.markdown("""
     <style>
     .main-title {
@@ -81,13 +83,24 @@ st.markdown("""
         border: 1px solid #E0E0E0;
         border-radius: 5px;
     }
+    .warning-note {
+        background-color: #fff3cd;
+        color: #856404;
+        padding: 10px;
+        border-radius: 5px;
+        border: 1px solid #ffeaa7;
+        margin-top: 10px;
+        font-size: 0.9em;
+    }
     </style>
 """, unsafe_allow_html=True)
 
+# --- Helper Functions ---
+
 def get_headers():
-    """Generate headers with a random user agent."""
+    """Generate headers with a User-Agent."""
     return {
-        "User-Agent": USER_AGENT,
+        "User-Agent": BASE_USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
@@ -107,124 +120,48 @@ def is_valid_url(url):
     except:
         return False
 
-def is_same_domain(url1, url2):
-    """Check if two URLs belong to the same domain."""
+def is_internal_link(base_url, link_url):
+    """Check if a link is internal to the base domain."""
     try:
-        domain1 = urlparse(url1).netloc
-        domain2 = urlparse(url2).netloc
-        # Normalize domains by removing 'www.' for comparison
-        domain1 = domain1.replace('www.', '')
-        domain2 = domain2.replace('www.', '')
-        return domain1 == domain2
+        base_parsed = urlparse(base_url)
+        link_parsed = urlparse(link_url)
+        # Compare network locations (netloc) after removing 'www.' for consistency
+        base_netloc = base_parsed.netloc.replace('www.', '')
+        link_netloc = link_parsed.netloc.replace('www.', '')
+        return base_netloc == link_netloc
     except:
         return False
 
 def normalize_url(url):
-    """Normalize a URL by removing fragments and standardizing."""
+    """Normalize a URL for consistent comparison (removes fragments)."""
     try:
         parsed = urlparse(url)
-        # Reconstruct URL without fragment for comparison
         normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         if parsed.query:
-             # Include query params but sort them for consistency
-             params = sorted(parsed.query.split('&'))
-             normalized += '?' + '&'.join(params)
+            # Sort query parameters for consistent key ordering
+            params = sorted(parsed.query.split('&'))
+            normalized += '?' + '&'.join(params)
         return normalized.lower()
     except:
         return url.lower()
 
-def fetch_page_content(url, timeout=15, retries=2, backoff_factor=1.0):
-    """
-    Fetch page content with retries and exponential backoff.
-    """
-    headers = get_headers()
-    for attempt in range(retries + 1):
-        try:
-            # Adding a small random delay before request to be polite
-            time.sleep(random.uniform(0.1, 0.5))
-            response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            response.raise_for_status() # Raise an exception for bad status codes
-            return response
-        except requests.exceptions.RequestException as e:
-            if attempt < retries:
-                wait_time = backoff_factor * (2 ** attempt) + random.uniform(0, 1)
-                st.warning(f"Attempt {attempt + 1} failed for {url}. Retrying in {wait_time:.2f}s... Error: {type(e).__name__}")
-                time.sleep(wait_time)
-            else:
-                 st.error(f"Failed to fetch {url} after {retries + 1} attempts. Error: {e}")
-                 return None
-    return None
+def fetch_page(url, timeout=15):
+    """Fetch a single page with error handling."""
+    try:
+        headers = get_headers()
+        # Add a small random delay to be respectful
+        time.sleep(random.uniform(0.1, 0.3))
+        response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Failed to fetch {url}: {type(e).__name__}")
+        return None
 
-def scrape_website_comprehensive_requests(base_url, delay_seconds=5, max_pages=None, status_placeholder=None):
-    """
-    Crawl a website using requests/BeautifulSoup to find WhatsApp links.
-    Note: This cannot execute JavaScript but uses retries and delays to try and capture
-    content that might appear quickly or be present in initial HTML.
-    """
-    if not is_valid_url(base_url):
-        st.error("Invalid base URL provided.")
-        return []
-
-    whatsapp_links = set()
-    visited_urls = set()
-    url_queue = deque([base_url])
-    pages_crawled = 0
-
-    if status_placeholder:
-        status_placeholder.info("Starting website crawl with requests (no JS execution)...")
-
-    while url_queue and (max_pages is None or pages_crawled < max_pages):
-        current_url = url_queue.popleft()
-        normalized_current_url = normalize_url(current_url)
-
-        if normalized_current_url in visited_urls:
-            continue
-
-        visited_urls.add(normalized_current_url)
-        pages_crawled += 1
-
-        if status_placeholder:
-            status_placeholder.info(f"Crawling ({pages_crawled}): {current_url[:100]}...")
-
-        # --- Fetch page content ---
-        # Use a longer timeout to mimic waiting for content
-        effective_timeout = max(15, delay_seconds + 5) # Ensure a minimum timeout
-        response = fetch_page_content(current_url, timeout=effective_timeout)
-
-        if response is None:
-            continue # Error already logged in fetch_page_content
-
-        # --- Parse HTML ---
-        try:
-            soup = BeautifulSoup(response.text, 'html.parser')
-        except Exception as e:
-            if status_placeholder:
-                status_placeholder.warning(f"Error parsing HTML for {current_url}: {e}")
-            continue
-
-        # --- Find WhatsApp Links ---
-        links_on_page = soup.find_all('a', href=True)
-        for link_tag in links_on_page:
-            href = link_tag['href']
-            absolute_href = urljoin(current_url, href)
-
-            # Check if it's a WhatsApp group link
-            if absolute_href.startswith(WHATSAPP_DOMAIN):
-                whatsapp_links.add(absolute_href)
-
-            # Check if it's an internal link for further crawling
-            elif is_same_domain(current_url, absolute_href) and is_valid_url(absolute_href):
-                normalized_href = normalize_url(absolute_href)
-                if normalized_href not in visited_urls:
-                    url_queue.append(absolute_href)
-
-    if status_placeholder:
-        status_placeholder.success(f"Crawling completed. Visited {pages_crawled} pages.")
-
-    return list(whatsapp_links)
+# --- Core Logic Functions ---
 
 def validate_link(link):
-    """Validate a WhatsApp group link and return details if active."""
+    """Validate a WhatsApp group link and return details."""
     result = {
         "Group Name": "Expired",
         "Group Link": link,
@@ -232,7 +169,7 @@ def validate_link(link):
         "Status": "Expired"
     }
     try:
-        headers = get_headers() # Use rotating user agent
+        headers = get_headers()
         response = requests.get(link, headers=headers, timeout=15, allow_redirects=True)
         if WHATSAPP_DOMAIN not in response.url:
             return result
@@ -247,64 +184,141 @@ def validate_link(link):
                 result["Status"] = "Active"
                 break
         return result
-    except Exception as e:
-         # Optional: Log validation errors for debugging
-         # st.warning(f"Validation error for {link}: {e}")
+    except Exception:
+        # Optional: Log specific validation errors for debugging
+        # st.warning(f"Validation error for {link}: {e}")
         return result
 
 def scrape_whatsapp_links(url):
-    """Scrape WhatsApp group links from a webpage."""
+    """Scrape WhatsApp group links from a single webpage."""
     try:
-        headers = get_headers() # Use rotating user agent
+        headers = get_headers()
         response = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
         links = [a['href'] for a in soup.find_all('a', href=True) if a['href'].startswith(WHATSAPP_DOMAIN)]
         return links
-    except Exception as e:
-         # Optional: Log scraping errors for debugging
-         # st.warning(f"Scraping error for {url}: {e}")
+    except Exception:
+        # Optional: Log specific scraping errors for debugging
+        # st.warning(f"Scraping error for {url}: {e}")
         return []
 
 def google_search(query, num_pages):
-    """Custom Google search to fetch URLs from multiple pages."""
+    """Perform a custom Google search to fetch URLs from multiple pages."""
     search_results = []
-    headers = get_headers() # Use rotating user agent
+    headers = get_headers()
     for page in range(num_pages):
         params = {
             "q": query,
             "start": page * 10
         }
         try:
-            # Longer timeout for search
             response = requests.get(GOOGLE_SEARCH_URL, headers=headers, params=params, timeout=20)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if href.startswith('/url?q='):
+                    # Extract the actual URL from Google's redirect link
                     url = href.split('/url?q=')[1].split('&')[0]
                     search_results.append(url)
-            time.sleep(random.uniform(2, 4)) # Randomized pause to be polite
+            # Pause between requests to be respectful
+            time.sleep(random.uniform(1, 2))
         except Exception as e:
-            st.error(f"Error on Google page {page + 1}: {e}")
+            st.error(f"Error fetching Google page {page + 1}: {e}")
             break
+    # Return unique URLs
     return list(set(search_results))
 
 def load_links(uploaded_file):
     """Load WhatsApp group links from an uploaded TXT or CSV file."""
-    if uploaded_file.name.endswith('.csv'):
-        return pd.read_csv(uploaded_file).iloc[:, 0].tolist()
-    else:
-        # Decode bytes to string
-        content = uploaded_file.read().decode('utf-8')
-        return [line.strip() for line in content.splitlines() if line.strip()]
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            # Read the first column, assuming it contains the links
+            df = pd.read_csv(uploaded_file, header=None)
+            if not df.empty:
+                 # Get the first column and convert to list of strings, stripping whitespace
+                return df.iloc[:, 0].astype(str).str.strip().tolist()
+            else:
+                return []
+        else:
+            # For TXT files, read lines
+            content = uploaded_file.read().decode('utf-8')
+            # Handle different line endings (\r\n, \n)
+            lines = content.replace('\r\n', '\n').split('\n')
+            return [line.strip() for line in lines if line.strip()]
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return []
+
+def scrape_entire_website(base_url, max_pages, status_placeholder):
+    """
+    Crawl an entire website (limited by max_pages) to find WhatsApp links.
+    Note: This uses requests/BeautifulSoup and cannot execute JavaScript.
+    """
+    if not is_valid_url(base_url):
+        st.error("Invalid base URL provided.")
+        return []
+
+    found_links = set()
+    visited_urls = set()
+    # Use a queue for breadth-first crawling
+    urls_to_visit = deque([base_url])
+    pages_crawled = 0
+
+    status_placeholder.info("Starting website crawl... (Note: Cannot execute JavaScript)")
+
+    while urls_to_visit and (max_pages is None or pages_crawled < max_pages):
+        current_url = urls_to_visit.popleft()
+        normalized_url = normalize_url(current_url)
+
+        # Skip if already visited
+        if normalized_url in visited_urls:
+            continue
+
+        visited_urls.add(normalized_url)
+        pages_crawled += 1
+
+        status_placeholder.info(f"Crawling ({pages_crawled}/{max_pages if max_pages else '∞'}): {current_url[:70]}{'...' if len(current_url) > 70 else ''}")
+
+        response = fetch_page(current_url, timeout=15)
+        if response is None:
+            continue
+
+        try:
+            soup = BeautifulSoup(response.text, 'html.parser')
+        except Exception as e:
+            st.warning(f"Error parsing HTML for {current_url}: {e}")
+            continue
+
+        # --- Extract Links ---
+        page_links = soup.find_all('a', href=True)
+        for link_tag in page_links:
+            href = link_tag['href']
+            # Resolve relative URLs to absolute URLs
+            absolute_href = urljoin(current_url, href)
+
+            # Check if it's a WhatsApp group link
+            if absolute_href.startswith(WHATSAPP_DOMAIN):
+                found_links.add(absolute_href)
+
+            # Check if it's an internal link for further crawling
+            # Only add if it's a valid URL, internal, and we haven't seen its normalized form
+            elif is_internal_link(base_url, absolute_href) and is_valid_url(absolute_href):
+                normalized_href = normalize_url(absolute_href)
+                if normalized_href not in visited_urls:
+                    urls_to_visit.append(absolute_href)
+
+    status_placeholder.success(f"Crawling finished. Visited {pages_crawled} pages.")
+    return list(found_links)
+
+# --- Main Application Function ---
 
 def main():
     """Main function for the WhatsApp Group Validator app."""
     st.markdown('<h1 class="main-title">WhatsApp Group Validator 🚀</h1>', unsafe_allow_html=True)
     st.markdown('<p class="subtitle">Search, scrape, or validate WhatsApp group links with ease</p>', unsafe_allow_html=True)
 
-    # Sidebar for settings
+    # --- Sidebar for Settings ---
     with st.sidebar:
         st.header("⚙️ Settings")
         st.markdown("Customize your experience")
@@ -314,33 +328,29 @@ def main():
                 "Search and Scrape from Google",
                 "Enter Links Manually",
                 "Upload File (TXT/CSV)",
-                "Scrape Entire Website (Requests)"
+                "Scrape Entire Website"
             ],
             help="Choose how to input links"
         )
 
         if input_method == "Search and Scrape from Google":
-            num_pages = st.slider("Google Pages to Scrape", min_value=1, max_value=5, value=3, help="More pages may increase scraping time")
-        elif input_method == "Scrape Entire Website (Requests)":
-            delay_seconds = st.slider("Simulated JS Load Delay (seconds)", min_value=0, max_value=30, value=5,
-                                      help="Extra time to wait for page load (note: no real JS execution)")
-            max_pages = st.number_input("Max Pages to Crawl (0 for unlimited)", min_value=0, value=50,
-                                        help="Limit crawling to avoid excessive runtime. Set to 0 for no limit (use carefully).")
-            if max_pages == 0:
-                max_pages = None
+            num_pages = st.slider("Google Pages to Scrape", min_value=1, max_value=10, value=3, help="More pages = more links, longer time")
+        elif input_method == "Scrape Entire Website":
+            max_pages = st.number_input("Max Pages to Crawl", min_value=1, value=50, step=10,
+                                        help="Limit crawling depth. Set higher for larger sites (slower).")
 
-    # Clear Results Button
+    # --- Clear Results Button ---
     if st.button("🗑️ Clear Results", use_container_width=True):
         if 'results' in st.session_state:
             del st.session_state['results']
-        st.success("Results cleared successfully!")
+        st.success("Results cleared!")
 
-    # Input Section
+    # --- Input Section ---
     with st.container():
         results = []
         if input_method == "Search and Scrape from Google":
             st.subheader("🔍 Google Search & Scrape")
-            keyword = st.text_input("Search Query:", placeholder="e.g., 'whatsapp group links site:*.com -inurl:(login)'", help="Refine with site: or -inurl:")
+            keyword = st.text_input("Search Query:", placeholder="e.g., 'whatsapp group links site:example.com'", help="Use Google search operators for better results")
             if st.button("Search, Scrape, and Validate", use_container_width=True):
                 if not keyword:
                     st.warning("Please enter a search query.")
@@ -348,76 +358,81 @@ def main():
                 with st.spinner("Searching Google..."):
                     search_results = google_search(keyword, num_pages)
                 if not search_results:
-                    st.info("No search results found for the query.")
+                    st.info("No search results found.")
                     return
-                st.success(f"Found {len(search_results)} webpages. Scraping WhatsApp links...")
+                st.success(f"Found {len(search_results)} unique webpages. Scraping for WhatsApp links...")
+
+                # Scrape links from search results
                 all_links = []
                 progress_bar = st.progress(0)
-                total_search_results = len(search_results)
+                total_results = len(search_results)
                 for idx, url in enumerate(search_results):
                     links = scrape_whatsapp_links(url)
                     all_links.extend(links)
-                    progress_bar.progress((idx + 1) / total_search_results)
-                unique_links = list(set(all_links))
+                    progress_bar.progress((idx + 1) / total_results)
+                
+                unique_links = list(set(all_links)) # Remove duplicates from scraping
                 if not unique_links:
-                    st.warning("No WhatsApp group links found in the scraped webpages.")
+                    st.warning("No WhatsApp group links found on the scraped pages.")
                     return
                 st.success(f"Scraped {len(unique_links)} unique WhatsApp group links. Validating...")
+
+                # Validate the unique links
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                total_unique_links = len(unique_links)
+                total_links = len(unique_links)
                 for i, link in enumerate(unique_links):
                     result = validate_link(link)
                     results.append(result)
-                    progress_bar.progress((i + 1) / total_unique_links)
-                    status_text.text(f"Validated {i + 1}/{total_unique_links} links")
-                status_text.empty() # Clear status when done
+                    progress_bar.progress((i + 1) / total_links)
+                    status_text.text(f"Validating: {i + 1}/{total_links}")
+                status_text.empty() # Clear status text when done
 
-        elif input_method == "Scrape Entire Website (Requests)":
-            st.subheader("🕷️ Scrape Entire Website (Requests-based)")
-            base_url = st.text_input("Base Website URL:", placeholder="e.g., https://example.com",
-                                     help="The starting point for crawling the website")
-            st.info("⚠️ **Note:** This method uses `requests` and `BeautifulSoup`. It **cannot** execute JavaScript. It will only find links present in the initial HTML or loaded very quickly. For sites with heavy JS delays, results may be limited.")
+        elif input_method == "Scrape Entire Website":
+            st.subheader("🕷️ Scrape Entire Website")
+            base_url = st.text_input("Base Website URL:", placeholder="e.g., https://example.com", help="Start crawling from this page")
+            
+            st.markdown(
+                '<div class="warning-note"><b>⚠️ Important:</b> This method uses <code>requests</code> and <code>BeautifulSoup</code>. '
+                'It <b>cannot execute JavaScript</b>. It will only find links present in the initial HTML. '
+                'Links that appear after a delay (like 5-10s) via JavaScript <b>will not be found</b>.</div>',
+                unsafe_allow_html=True
+            )
+
             if st.button("Crawl, Scrape, and Validate", use_container_width=True):
                 if not base_url:
                     st.warning("Please enter a base website URL.")
                     return
 
                 status_placeholder = st.empty()
-                status_placeholder.info("Starting website crawl...")
-
                 try:
-                    unique_links = scrape_website_comprehensive_requests(
-                        base_url,
-                        delay_seconds=delay_seconds,
-                        max_pages=max_pages,
-                        status_placeholder=status_placeholder
-                    )
+                    unique_links = scrape_entire_website(base_url, max_pages, status_placeholder)
                 except Exception as e:
-                    st.error(f"An unexpected error occurred during crawling: {e}")
+                    st.error(f"An error occurred during crawling: {e}")
                     return
 
                 if not unique_links:
-                    st.warning("No WhatsApp group links found on the crawled website.")
+                    st.warning("No WhatsApp group links found during the crawl.")
                     return
 
                 st.success(f"Scraped {len(unique_links)} unique WhatsApp group links. Validating...")
+                
+                # Validate the unique links found by crawling
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                total_unique_links = len(unique_links)
+                total_links = len(unique_links)
                 for i, link in enumerate(unique_links):
                     result = validate_link(link)
                     results.append(result)
-                    progress_bar.progress((i + 1) / total_unique_links)
-                    status_text.text(f"Validated {i + 1}/{total_unique_links} links")
-                status_text.empty() # Clear status when done
-
+                    progress_bar.progress((i + 1) / total_links)
+                    status_text.text(f"Validating: {i + 1}/{total_links}")
+                status_text.empty() # Clear status text when done
 
         elif input_method == "Enter Links Manually":
             st.subheader("📝 Manual Link Entry")
-            links_text = st.text_area("Enter WhatsApp Links (one per line):", height=200, placeholder="e.g., https://chat.whatsapp.com/ABC123")
+            links_text = st.text_area("Enter WhatsApp Links (one per line):", height=200, placeholder="https://chat.whatsapp.com/...")
             if st.button("Validate Links", use_container_width=True):
-                # Handle potential different line endings
+                # Handle different line endings robustly
                 links = [line.strip() for line in links_text.replace('\r\n', '\n').split('\n') if line.strip()]
                 if not links:
                     st.warning("Please enter at least one link.")
@@ -429,18 +444,14 @@ def main():
                     result = validate_link(link)
                     results.append(result)
                     progress_bar.progress((i + 1) / total_links)
-                    status_text.text(f"Validated {i + 1}/{total_links} links")
-                status_text.empty() # Clear status when done
+                    status_text.text(f"Validating: {i + 1}/{total_links}")
+                status_text.empty() # Clear status text when done
 
         elif input_method == "Upload File (TXT/CSV)":
             st.subheader("📥 File Upload")
-            uploaded_file = st.file_uploader("Upload TXT or CSV", type=["txt", "csv"], help="One link per line or in first column")
+            uploaded_file = st.file_uploader("Upload TXT or CSV", type=["txt", "csv"], help="One link per line (TXT) or in the first column (CSV)")
             if uploaded_file and st.button("Validate File Links", use_container_width=True):
-                try:
-                    links = load_links(uploaded_file)
-                except Exception as e:
-                     st.error(f"Error reading file: {e}")
-                     return
+                links = load_links(uploaded_file)
                 if not links:
                     st.warning("No links found in the uploaded file.")
                     return
@@ -451,14 +462,14 @@ def main():
                     result = validate_link(link)
                     results.append(result)
                     progress_bar.progress((i + 1) / total_links)
-                    status_text.text(f"Validated {i + 1}/{total_links} links")
-                status_text.empty() # Clear status when done
+                    status_text.text(f"Validating: {i + 1}/{total_links}")
+                status_text.empty() # Clear status text when done
 
-        # Store results in session state
+        # Store results in session state if any were generated
         if results:
             st.session_state['results'] = results
 
-    # Results Section
+    # --- Results Section ---
     if 'results' in st.session_state:
         df = pd.DataFrame(st.session_state['results'])
         active_df = df[df['Status'] == 'Active']
@@ -469,26 +480,28 @@ def main():
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Total Links", len(df), help="Total links processed")
+            st.metric("Total Links", len(df))
             st.markdown('</div>', unsafe_allow_html=True)
         with col2:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Active Links", len(active_df), help="Valid WhatsApp groups")
+            st.metric("Active Links", len(active_df))
             st.markdown('</div>', unsafe_allow_html=True)
         with col3:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Expired Links", len(expired_df), help="Invalid or expired links")
+            st.metric("Expired Links", len(expired_df))
             st.markdown('</div>', unsafe_allow_html=True)
 
         # Filter and Display Results
         with st.expander("🔎 View and Filter Results", expanded=True):
-            status_filter = st.multiselect("Filter by Status", options=["Active", "Expired"], default=["Active"], help="Select statuses to display")
+            status_filter = st.multiselect("Filter by Status", options=["Active", "Expired"], default=["Active"])
+            # Apply filter if selections are made, otherwise show all
             filtered_df = df[df['Status'].isin(status_filter)] if status_filter else df
+            
             st.dataframe(
                 filtered_df,
                 column_config={
-                    "Group Link": st.column_config.LinkColumn("Invite Link", display_text="Join Group", help="Click to join"),
-                    "Logo URL": st.column_config.LinkColumn("Logo", help="Click to view logo")
+                    "Group Link": st.column_config.LinkColumn("Invite Link", display_text="Join Group"),
+                    "Logo URL": st.column_config.LinkColumn("Group Logo", display_text="🖼️")
                 },
                 height=400,
                 use_container_width=True
@@ -499,23 +512,23 @@ def main():
         with col_dl1:
             csv_active = active_df.to_csv(index=False)
             st.download_button(
-                "📥 Download Active Groups",
+                "📥 Download Active Groups (CSV)",
                 csv_active,
-                "active_groups.csv",
+                "active_whatsapp_groups.csv",
                 "text/csv",
                 use_container_width=True
             )
         with col_dl2:
             csv_all = df.to_csv(index=False)
             st.download_button(
-                "📥 Download All Results",
+                "📥 Download All Results (CSV)",
                 csv_all,
-                "all_groups.csv",
+                "all_whatsapp_groups.csv",
                 "text/csv",
                 use_container_width=True
             )
     else:
-        st.info("Select an input method and start validating WhatsApp group links!", icon="ℹ️")
+        st.info("👈 Select an input method from the sidebar and start validating!", icon="ℹ️")
 
 if __name__ == "__main__":
     main()

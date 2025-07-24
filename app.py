@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 import re
 import time
 import logging
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote_plus
 import pandas as pd
 import io
 
@@ -16,107 +16,166 @@ REALGROUP_CATEGORY_AJAX = "/load-more-cat.php"
 GROUPSOR_BASE_URL = "https://groupsor.link"
 GROUPSOR_SEARCH_AJAX = "/group/findmore"
 GROUPSOR_SEARCH_PAGE = "/group/search"
-TIMEOUT = 15
+TIMEOUT = 20  # Increased timeout
 MAX_RETRIES = 2
-RETRY_DELAY = 2 # seconds
+RETRY_DELAY = 3 # seconds, increased delay
+DEFAULT_DELAY = 1 # second, delay between requests
 
 # --- Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set level to WARNING to reduce Streamlit log output, or use DEBUG for development
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# --- Session State Initialization ---
+if 'scraping_state' not in st.session_state:
+    st.session_state.scraping_state = 'idle' # 'idle', 'running', 'paused', 'stopped'
+if 'scraped_data' not in st.session_state:
+    st.session_state.scraped_data = []
+if 'scraping_progress' not in st.session_state: # For progress bar
+    st.session_state.scraping_progress = 0
+if 'scraping_message' not in st.session_state:
+    st.session_state.scraping_message = "Ready to start."
+if 'current_task' not in st.session_state: # Description of current task
+    st.session_state.current_task = ""
+if 'session_object' not in st.session_state: # Persistent requests session
+    st.session_state.session_object = None
 
 # --- Helper Functions ---
 
-def get_final_whatsapp_url_rgl(group_url, session):
-    """
-    Fetches the RGL intermediate page and extracts the final WhatsApp URL.
-    Handles retries.
-    """
+def create_robust_session():
+    """Creates a requests session with common headers to mimic a browser."""
+    session = requests.Session()
+    # More comprehensive headers
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Referer': '', # Will be set dynamically
+        'DNT': '1', # Do Not Track
+        # 'Upgrade-Insecure-Requests': '1', # Sometimes helpful
+    })
+    return session
+
+def safe_request(session, method, url, **kwargs):
+    """Makes a request with retries and delays, handling common errors."""
+    logger.debug(f"Making {method} request to {url}")
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = session.request(method, url, timeout=TIMEOUT, **kwargs)
+            response.raise_for_status()
+            # Optional: Check for Cloudflare or other blocking pages
+            # if "checking your browser" in response.text.lower() or response.status_code == 403:
+            #     logger.warning(f"Possible blocking page detected for {url}")
+            #     # Could trigger a longer delay or stop
+            return response
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 403:
+                logger.error(f"403 Forbidden for {url} on attempt {attempt + 1}. Check headers/cookies or site protection.")
+                st.session_state.scraping_message = f"⚠️ 403 Forbidden for {url}. Retrying ({attempt + 1}/{MAX_RETRIES + 1})..."
+                st.rerun() # Update UI message
+            elif response.status_code == 429:
+                 logger.warning(f"429 Too Many Requests for {url} on attempt {attempt + 1}.")
+                 st.session_state.scraping_message = f"⏳ 429 Rate Limited for {url}. Waiting longer..."
+                 time.sleep(RETRY_DELAY * 2)
+            else:
+                logger.error(f"HTTP Error {response.status_code} for {url} on attempt {attempt + 1}: {e}")
+                st.session_state.scraping_message = f"⚠️ HTTP {response.status_code} Error for {url}. Retrying ({attempt + 1}/{MAX_RETRIES + 1})..."
+                st.rerun()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed for {url} on attempt {attempt + 1}: {e}")
+            st.session_state.scraping_message = f"⚠️ Request Error for {url}. Retrying ({attempt + 1}/{MAX_RETRIES + 1})..."
+            st.rerun()
+
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY)
+        else:
+            logger.error(f"Failed to fetch {url} after {MAX_RETRIES + 1} attempts.")
+            st.session_state.scraping_message = f"❌ Failed to fetch {url} after retries."
+            st.rerun()
+    return None # Should not be reached if retries exhausted
+
+
+def get_final_whatsapp_url_rgl(group_url):
+    """Fetches the RGL intermediate page and extracts the final WhatsApp URL."""
+    if not st.session_state.session_object:
+        st.session_state.session_object = create_robust_session()
+    session = st.session_state.session_object
+
     logger.info(f"Fetching RGL intermediate page: {group_url}")
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            response = session.get(group_url, timeout=TIMEOUT)
-            response.raise_for_status()
+    st.session_state.current_task = f"Resolving RGL link: ...{group_url[-30:]}"
+    st.rerun() # Update UI
 
-            soup = BeautifulSoup(response.content, 'html.parser')
-            # Look for setTimeout with window.location.href
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string:
-                    # Match setTimeout(function(){window.location.href = 'URL';}, 7000);
-                    # Make regex flexible for spacing, quotes, and time value
-                    match = re.search(r"setTimeout\s*\(\s*function\s*\(\s*\)\s*{\s*window\.location\.href\s*=\s*['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]\s*;?\s*}\s*,\s*\d+\s*\)", script.string, re.DOTALL)
-                    if match:
-                        final_url = match.group(1)
-                        logger.info(f"Found final URL in JS: {final_url}")
-                        return final_url
+    response = safe_request(session, 'GET', group_url)
+    if not response:
+        return None
 
-            logger.warning(f"Final URL not found in JS on {group_url}")
-            return group_url # Return intermediate link if not found
+    try:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string:
+                match = re.search(r"setTimeout\s*\(\s*function\s*\(\s*\)\s*{\s*window\.location\.href\s*=\s*['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]\s*;?\s*}\s*,\s*\d+\s*\)", script.string, re.DOTALL)
+                if match:
+                    final_url = match.group(1)
+                    logger.info(f"Found final URL in JS: {final_url}")
+                    return final_url
+        logger.warning(f"Final URL not found in JS on {group_url}")
+        return group_url
+    except Exception as e:
+        logger.error(f"Error parsing RGL page {group_url}: {e}")
+        return None
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Attempt {attempt + 1} failed fetching {group_url}: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
-            else:
-                logger.error(f"Failed to fetch {group_url} after {MAX_RETRIES + 1} attempts.")
-                return None
-        except Exception as e:
-            logger.error(f"Unexpected error parsing {group_url}: {e}")
-            return None
-    return None
+def get_final_whatsapp_url_gs(join_url):
+    """Fetches the GroupSor join page and extracts the final WhatsApp URL."""
+    if not st.session_state.session_object:
+        st.session_state.session_object = create_robust_session()
+    session = st.session_state.session_object
 
-def get_final_whatsapp_url_gs(join_url, session):
-    """
-    Fetches the GroupSor join page and extracts the final WhatsApp URL.
-    Handles retries.
-    """
     logger.info(f"Fetching GroupSor join page: {join_url}")
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            response = session.get(join_url, timeout=TIMEOUT)
-            response.raise_for_status()
+    st.session_state.current_task = f"Resolving GroupSor link: ...{join_url[-30:]}"
+    st.rerun()
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+    # Ensure session is initialized for GroupSor (might need initial search page visit)
+    # This might help set initial cookies, though not always necessary.
+    # session.get(f"{GROUPSOR_BASE_URL}/", timeout=TIMEOUT) # Uncomment if needed
 
-            # 1. Direct link
-            whatsapp_links = soup.find_all('a', href=re.compile(r'chat\.whatsapp\.com'))
-            for link_tag in whatsapp_links:
-                href = link_tag.get('href')
-                if href and 'chat.whatsapp.com' in href:
-                    logger.info(f"Found final URL (direct link): {href}")
-                    return href
+    response = safe_request(session, 'GET', join_url)
+    if not response:
+        return None
 
-            # 2. JS patterns (window.location.href, window.open)
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string:
-                    # window.location.href = 'URL';
-                    loc_match = re.search(r"window\.location\.href\s*=\s*['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]", script.string, re.IGNORECASE)
-                    if loc_match:
-                        final_url = loc_match.group(1)
-                        logger.info(f"Found final URL in JS (window.location): {final_url}")
-                        return final_url
-                    # window.open('URL');
-                    open_match = re.search(r"window\.open\(['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]", script.string, re.IGNORECASE)
-                    if open_match:
-                        final_url = open_match.group(1)
-                        logger.info(f"Found final URL in JS (window.open): {final_url}")
-                        return final_url
+    try:
+        soup = BeautifulSoup(response.content, 'html.parser')
 
-            logger.warning(f"Final URL not found on GroupSor join page {join_url}")
-            return None
+        # 1. Direct link
+        whatsapp_links = soup.find_all('a', href=re.compile(r'chat\.whatsapp\.com'))
+        for link_tag in whatsapp_links:
+            href = link_tag.get('href')
+            if href and 'chat.whatsapp.com' in href:
+                logger.info(f"Found final URL (direct link): {href}")
+                return href
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Attempt {attempt + 1} failed fetching {join_url}: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
-            else:
-                logger.error(f"Failed to fetch {join_url} after {MAX_RETRIES + 1} attempts.")
-                return None
-        except Exception as e:
-            logger.error(f"Unexpected error parsing GroupSor join page {join_url}: {e}")
-            return None
-    return None
+        # 2. JS patterns
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string:
+                loc_match = re.search(r"window\.location\.href\s*=\s*['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]", script.string, re.IGNORECASE)
+                if loc_match:
+                    final_url = loc_match.group(1)
+                    logger.info(f"Found final URL in JS (window.location): {final_url}")
+                    return final_url
+                open_match = re.search(r"window\.open\(['\"](https?://chat\.whatsapp\.com/[^'\"]*)['\"]", script.string, re.IGNORECASE)
+                if open_match:
+                    final_url = open_match.group(1)
+                    logger.info(f"Found final URL in JS (window.open): {final_url}")
+                    return final_url
+
+        logger.warning(f"Final URL not found on GroupSor join page {join_url}")
+        return None
+    except Exception as e:
+        logger.error(f"Error parsing GroupSor join page {join_url}: {e}")
+        return None
 
 def extract_rgl_links(html_content, base_url):
     """Extracts direct and intermediate group links from RGL HTML."""
@@ -124,7 +183,6 @@ def extract_rgl_links(html_content, base_url):
     intermediate_links = set()
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # Direct links
     direct_link_tags = soup.find_all('a', href=re.compile(r'chat\.whatsapp\.com'))
     for tag in direct_link_tags:
         href = tag.get('href')
@@ -133,8 +191,6 @@ def extract_rgl_links(html_content, base_url):
             if parsed_url.scheme and parsed_url.netloc and 'chat.whatsapp.com' in parsed_url.netloc:
                 direct_links.add(href)
 
-    # Intermediate links (from onclick)
-    # Example: onclick="singlegroup('https://realgrouplinks.com/group.php?id=775164',...
     potential_intermediates = soup.find_all('a', onclick=re.compile(r'group\.php\?id='))
     for tag in potential_intermediates:
         onclick_attr = tag.get('onclick')
@@ -145,123 +201,171 @@ def extract_rgl_links(html_content, base_url):
                 full_url = urljoin(base_url, relative_or_absolute_url)
                 intermediate_links.add(full_url)
 
-    logger.info(f"RGL Extracted {len(direct_links)} direct, {len(intermediate_links)} intermediate links.")
+    logger.debug(f"RGL Extracted {len(direct_links)} direct, {len(intermediate_links)} intermediate links.")
     return list(direct_links), list(intermediate_links)
 
-def scrape_rgl_homepage(base_url, session):
-    """Scrapes the RGL homepage and its AJAX-loaded content."""
+def scrape_rgl_homepage():
+    """Scrapes the RGL homepage and its AJAX-loaded content (with pause/resume/stop)."""
+    if not st.session_state.session_object:
+        st.session_state.session_object = create_robust_session()
+    session = st.session_state.session_object
+    base_url = REALGROUP_BASE_URL
     all_results = []
+
     try:
-        response = session.get(base_url, timeout=TIMEOUT)
-        response.raise_for_status()
+        st.session_state.current_task = "Fetching RGL Homepage..."
+        st.rerun()
+        response = safe_request(session, 'GET', base_url)
+        if not response:
+            st.session_state.scraping_message = "Failed to fetch RGL homepage."
+            return []
         initial_html = response.text
         direct_links, intermediate_links = extract_rgl_links(initial_html, base_url)
         all_results.extend([{"Type": "Direct (Homepage)", "Source": base_url, "Link": link} for link in direct_links])
         all_results.extend([{"Type": "Intermediate (Homepage)", "Source": base_url, "Link": link} for link in intermediate_links])
-        st.info(f"Homepage: Found {len(direct_links) + len(intermediate_links)} initial links.")
+        st.session_state.scraping_message = f"Homepage: {len(direct_links) + len(intermediate_links)} initial links."
+        st.rerun()
+        time.sleep(DEFAULT_DELAY)
 
-        # Scrape AJAX pages (Homepage uses /more-groups.php)
-        page_counter = 16 # Starts at 16 based on JS analysis
-        while True:
-            st.info(f"Homepage AJAX: Fetching page with commentNewCount={page_counter}...")
+        page_counter = 16
+        while st.session_state.scraping_state == 'running':
+            st.session_state.current_task = f"Homepage AJAX (count={page_counter})..."
+            st.rerun()
             ajax_data = {'commentNewCount': page_counter}
-            ajax_response = session.post(urljoin(base_url, REALGROUP_HOMEPAGE_AJAX), data=ajax_data, timeout=TIMEOUT)
-            ajax_response.raise_for_status()
+            # Set referer for AJAX request
+            session.headers.update({'Referer': base_url})
+            ajax_response = safe_request(session, 'POST', urljoin(base_url, REALGROUP_HOMEPAGE_AJAX), data=ajax_data)
+            if not ajax_response:
+                st.session_state.scraping_message = f"Homepage AJAX failed at count {page_counter}."
+                break # Stop on AJAX failure
             ajax_html = ajax_response.text.strip()
 
             if not ajax_html:
-                st.info("Homepage AJAX: No more content.")
+                st.session_state.scraping_message = "Homepage AJAX: No more content."
                 break
 
             _, ajax_intermediates = extract_rgl_links(ajax_html, base_url)
             if not ajax_intermediates:
-                st.info("Homepage AJAX: No new links found, stopping.")
+                st.session_state.scraping_message = "Homepage AJAX: No new links, stopping."
                 break
 
-            all_results.extend([{"Type": "Intermediate (Homepage AJAX)", "Source": f"AJAX (commentNewCount={page_counter})", "Link": link} for link in ajax_intermediates])
-            st.info(f"Homepage AJAX: Found {len(ajax_intermediates)} links.")
-            page_counter += 8 # Increments by 8
-            time.sleep(0.5) # Be respectful
+            new_count = len(ajax_intermediates)
+            all_results.extend([{"Type": "Intermediate (Homepage AJAX)", "Source": f"AJAX (count={page_counter})", "Link": link} for link in ajax_intermediates])
+            st.session_state.scraping_message = f"Homepage AJAX (count={page_counter}): +{new_count} links."
+            st.rerun() # Update message
+            page_counter += 8
+            time.sleep(DEFAULT_DELAY) # Respectful delay
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error scraping RGL homepage: {e}")
     except Exception as e:
-        st.error(f"Unexpected error scraping RGL homepage: {e}")
+        logger.error(f"Error in RGL homepage scraping loop: {e}")
+        st.session_state.scraping_message = f"Error during RGL homepage scraping: {e}"
     return all_results
 
-def scrape_rgl_category(category_url, session):
-    """Scrapes an RGL category page and its AJAX-loaded content."""
+def scrape_rgl_category(category_url):
+    """Scrapes an RGL category page and its AJAX-loaded content (with pause/resume/stop)."""
+    if not st.session_state.session_object:
+        st.session_state.session_object = create_robust_session()
+    session = st.session_state.session_object
     all_results = []
+
     try:
-        response = session.get(category_url, timeout=TIMEOUT)
-        response.raise_for_status()
+        st.session_state.current_task = f"Fetching RGL Category: {category_url}"
+        st.rerun()
+        response = safe_request(session, 'GET', category_url)
+        if not response:
+             st.session_state.scraping_message = f"Failed to fetch RGL category {category_url}."
+             return []
         initial_html = response.text
         direct_links, intermediate_links = extract_rgl_links(initial_html, category_url)
         all_results.extend([{"Type": "Direct (Category)", "Source": category_url, "Link": link} for link in direct_links])
         all_results.extend([{"Type": "Intermediate (Category)", "Source": category_url, "Link": link} for link in intermediate_links])
-        st.info(f"Category: Found {len(direct_links) + len(intermediate_links)} initial links.")
+        st.session_state.scraping_message = f"Category: {len(direct_links) + len(intermediate_links)} initial links."
+        st.rerun()
+        time.sleep(DEFAULT_DELAY)
 
-        # Get category ID
         soup = BeautifulSoup(initial_html, 'html.parser')
         cat_id_input = soup.find('input', {'id': 'catid'})
         if not cat_id_input or not cat_id_input.get('value'):
-            st.warning("Could not find category ID, AJAX loading might fail.")
+            st.session_state.scraping_message = "Could not find category ID for AJAX."
+            st.rerun()
             return all_results
         cat_id = cat_id_input.get('value')
-        st.info(f"Found category ID: {cat_id}")
+        st.session_state.scraping_message = f"Found category ID: {cat_id}. Starting AJAX..."
+        st.rerun()
+        time.sleep(DEFAULT_DELAY)
 
-        # Scrape AJAX pages (Category uses /load-more-cat.php)
-        page_counter = 12 # Starts at 12 based on JS analysis
-        while True:
-            st.info(f"Category AJAX: Fetching page with commentNewCount={page_counter}, catid={cat_id}...")
+        page_counter = 12
+        while st.session_state.scraping_state == 'running':
+            st.session_state.current_task = f"Category AJAX (count={page_counter}, id={cat_id})..."
+            st.rerun()
             ajax_data = {'commentNewCount': page_counter, 'catid': cat_id}
-            ajax_response = session.post(urljoin(category_url, REALGROUP_CATEGORY_AJAX), data=ajax_data, timeout=TIMEOUT) # Use category_url as base for joining
-            ajax_response.raise_for_status()
+            session.headers.update({'Referer': category_url}) # Update referer
+            ajax_response = safe_request(session, 'POST', urljoin(category_url, REALGROUP_CATEGORY_AJAX), data=ajax_data) # Use category_url as base
+            if not ajax_response:
+                 st.session_state.scraping_message = f"Category AJAX failed at count {page_counter}."
+                 break
             ajax_html = ajax_response.text.strip()
 
             if not ajax_html:
-                st.info("Category AJAX: No more content.")
+                st.session_state.scraping_message = "Category AJAX: No more content."
                 break
 
-            _, ajax_intermediates = extract_rgl_links(ajax_html, category_url) # Use category_url as base
+            _, ajax_intermediates = extract_rgl_links(ajax_html, category_url)
             if not ajax_intermediates:
-                st.info("Category AJAX: No new links found, stopping.")
+                st.session_state.scraping_message = "Category AJAX: No new links, stopping."
                 break
 
-            all_results.extend([{"Type": "Intermediate (Category AJAX)", "Source": f"AJAX (commentNewCount={page_counter}, catid={cat_id})", "Link": link} for link in ajax_intermediates])
-            st.info(f"Category AJAX: Found {len(ajax_intermediates)} links.")
-            page_counter += 12 # Increments by 12 (page size)
-            time.sleep(0.5)
+            new_count = len(ajax_intermediates)
+            all_results.extend([{"Type": "Intermediate (Category AJAX)", "Source": f"AJAX (count={page_counter}, id={cat_id})", "Link": link} for link in ajax_intermediates])
+            st.session_state.scraping_message = f"Category AJAX (count={page_counter}): +{new_count} links."
+            st.rerun()
+            page_counter += 12
+            time.sleep(DEFAULT_DELAY)
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error scraping RGL category {category_url}: {e}")
     except Exception as e:
-        st.error(f"Unexpected error scraping RGL category {category_url}: {e}")
+        logger.error(f"Error in RGL category scraping loop: {e}")
+        st.session_state.scraping_message = f"Error during RGL category scraping: {e}"
     return all_results
 
-def scrape_gs_search(keyword, session):
-    """Scrapes GroupSor search results."""
-    all_results = []
+def scrape_gs_search(keyword):
+    """Scrapes GroupSor search results (with pause/resume/stop)."""
+    if not st.session_state.session_object:
+        st.session_state.session_object = create_robust_session()
+    session = st.session_state.session_object
     base_url = GROUPSOR_BASE_URL
-    try:
-        # Initial search request to get cookies/headers context if needed (might not be strictly necessary)
-        search_url = f"{base_url}{GROUPSOR_SEARCH_PAGE}?keyword={keyword}"
-        st.info(f"Initiating GroupSor search for: {keyword}")
-        session.get(search_url, timeout=TIMEOUT) # Might help set up session
+    all_results = []
 
-        page_counter = 0 # Starts at 0 based on JS
-        while True:
-            st.info(f"GroupSor Search AJAX: Fetching page {page_counter} for keyword '{keyword}'...")
+    try:
+        search_url = f"{base_url}{GROUPSOR_SEARCH_PAGE}?keyword={quote_plus(keyword)}"
+        st.session_state.current_task = f"Initiating GroupSor search for: {keyword}"
+        st.rerun()
+        # Initial search request to potentially set cookies/context
+        safe_request(session, 'GET', search_url)
+        time.sleep(DEFAULT_DELAY)
+
+        page_counter = 0
+        while st.session_state.scraping_state == 'running':
+            st.session_state.current_task = f"GroupSor Search AJAX (page={page_counter})..."
+            st.rerun()
             ajax_data = {'group_no': page_counter, 'keyword': keyword}
-            # Add referer header
             headers = {'Referer': search_url}
-            ajax_response = session.post(urljoin(base_url, GROUPSOR_SEARCH_AJAX), data=ajax_data, headers=headers, timeout=TIMEOUT)
-            ajax_response.raise_for_status()
+            # Update session headers temporarily
+            original_headers = session.headers.copy()
+            session.headers.update(headers)
+            ajax_response = safe_request(session, 'POST', urljoin(base_url, GROUPSOR_SEARCH_AJAX), data=ajax_data)
+            # Restore original headers
+            session.headers.clear()
+            session.headers.update(original_headers)
+
+            if not ajax_response:
+                 # Specific check for 403
+                 # Note: safe_request already handles retries, but if it fails completely...
+                 st.session_state.scraping_message = f"GroupSor AJAX failed at page {page_counter} (likely 403)."
+                 break # Stop scraping on persistent failure
             ajax_html = ajax_response.text.strip()
 
-            # Check for end condition (specific string found in provided file)
             if not ajax_html or "<div id=\"no\" style=\"display: none;color: #555\">No More groups</div>" in ajax_html:
-                st.info("GroupSor Search AJAX: No more content or end marker found.")
+                st.session_state.scraping_message = "GroupSor Search AJAX: No more content."
                 break
 
             soup = BeautifulSoup(ajax_html, 'html.parser')
@@ -274,58 +378,61 @@ def scrape_gs_search(keyword, session):
                     join_links.append(full_url)
 
             if not join_links:
-                st.info("GroupSor Search AJAX: No new join links found, stopping.")
+                st.session_state.scraping_message = "GroupSor Search AJAX: No new links, stopping."
                 break
 
-            all_results.extend([{"Type": "Intermediate (GroupSor Join Link)", "Source": f"Search AJAX (Page {page_counter})", "Link": link} for link in join_links])
-            st.info(f"GroupSor Search AJAX: Found {len(join_links)} join links.")
-            page_counter += 1 # Increments by 1
-            time.sleep(0.5)
+            new_count = len(join_links)
+            all_results.extend([{"Type": "Intermediate (GroupSor Join Link)", "Source": f"Search AJAX (page={page_counter})", "Link": link} for link in join_links])
+            st.session_state.scraping_message = f"GroupSor Search AJAX (page={page_counter}): +{new_count} links."
+            st.rerun()
+            page_counter += 1
+            time.sleep(DEFAULT_DELAY + 0.5) # Slightly longer delay for GroupSor
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error scraping GroupSor search for '{keyword}': {e}")
     except Exception as e:
-        st.error(f"Unexpected error scraping GroupSor search for '{keyword}': {e}")
+        logger.error(f"Error in GroupSor search scraping loop: {e}")
+        st.session_state.scraping_message = f"Error during GroupSor search scraping: {e}"
     return all_results
 
-
-def resolve_intermediate_links(results, session, competitor):
-    """Resolves intermediate links to final WhatsApp URLs."""
-    if not results:
+def resolve_intermediate_links(results, competitor):
+    """Resolves intermediate links to final WhatsApp URLs (with pause/resume/stop)."""
+    if not results or st.session_state.scraping_state != 'running':
         return results
 
     intermediate_results = [r for r in results if 'Intermediate' in r['Type']]
     if not intermediate_results:
-        st.info("No intermediate links to resolve.")
+        st.session_state.scraping_message = "No intermediate links to resolve."
+        st.rerun()
         return results
 
     resolved_results = []
-    failed_count = 0
-    progress_bar = st.progress(0)
     total_intermediates = len(intermediate_results)
+    st.session_state.scraping_message = f"Resolving {total_intermediates} intermediate links..."
+    st.rerun()
 
     for i, result in enumerate(intermediate_results):
+        if st.session_state.scraping_state != 'running':
+            break # Stop if paused or stopped
         intermediate_link = result['Link']
-        st.info(f"Resolving ({i+1}/{total_intermediates}): {intermediate_link}")
+        st.session_state.scraping_progress = (i + 1) / total_intermediates
+        st.session_state.current_task = f"Resolving {i+1}/{total_intermediates}"
+        st.rerun()
         final_url = None
 
         if competitor == "RealGroupLinks.com":
-            final_url = get_final_whatsapp_url_rgl(intermediate_link, session)
+            final_url = get_final_whatsapp_url_rgl(intermediate_link)
         elif competitor == "GroupSor.link":
-            final_url = get_final_whatsapp_url_gs(intermediate_link, session)
+            final_url = get_final_whatsapp_url_gs(intermediate_link)
 
         if final_url and final_url.startswith("http"):
             resolved_results.append({"Type": "Final (Resolved)", "Source": intermediate_link, "Link": final_url})
         else:
             resolved_results.append({"Type": "Final (Failed/Not Found)", "Source": intermediate_link, "Link": final_url or "ERROR"})
-            failed_count += 1
+        time.sleep(0.2) # Small delay between resolutions
 
-        progress_bar.progress((i + 1) / total_intermediates)
-        time.sleep(0.1) # Small delay
-
-    progress_bar.empty()
-    st.info(f"Finished resolving. Success: {len(intermediate_results) - failed_count}, Failed: {failed_count}")
-    # Combine non-intermediate original results with resolved ones
+    st.session_state.scraping_progress = 0 # Reset progress bar
+    success_count = len([r for r in resolved_results if r['Type'] == 'Final (Resolved)'])
+    st.session_state.scraping_message = f"Finished resolving. Success: {success_count}/{total_intermediates}"
+    st.rerun()
     non_intermediate_results = [r for r in results if 'Intermediate' not in r['Type']]
     return non_intermediate_results + resolved_results
 
@@ -334,7 +441,7 @@ def resolve_intermediate_links(results, session, competitor):
 def main():
     st.set_page_config(page_title="WhatsApp Group Scraper", page_icon="🔍")
     st.title("🔍 WhatsApp Group Scraper (RGL & GroupSor)")
-    st.markdown("Scrapes group links using `requests` and `BeautifulSoup4`.")
+    st.markdown("Scrapes group links. Handles pauses/stops.")
 
     # --- Configuration ---
     st.sidebar.header("Configuration")
@@ -353,58 +460,113 @@ def main():
 
     resolve_intermediates = st.sidebar.checkbox("Resolve Intermediate Links", value=True)
 
-    # --- Session State for Results ---
-    if 'scraped_data' not in st.session_state:
-        st.session_state.scraped_data = []
+    # --- Control Buttons ---
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("▶️ Start"):
+            if st.session_state.scraping_state == 'idle' or st.session_state.scraping_state == 'stopped':
+                st.session_state.scraped_data = []
+                st.session_state.scraping_state = 'running'
+                st.session_state.scraping_message = "Starting scrape..."
+                st.session_state.current_task = "Initializing..."
+                st.session_state.scraping_progress = 0
+                # Create session only if it doesn't exist or was closed
+                if not st.session_state.session_object:
+                     st.session_state.session_object = create_robust_session()
+                st.rerun()
+    with col2:
+        if st.button("⏸️ Pause"):
+            if st.session_state.scraping_state == 'running':
+                st.session_state.scraping_state = 'paused'
+                st.rerun()
+    with col3:
+        if st.button("⏹️ Stop"):
+            if st.session_state.scraping_state in ['running', 'paused']:
+                st.session_state.scraping_state = 'stopped'
+                st.session_state.scraping_message = "Scraping stopped by user."
+                st.session_state.current_task = "Stopped."
+                # Optionally close session
+                # if st.session_state.session_object:
+                #     st.session_state.session_object.close()
+                #     st.session_state.session_object = None
+                st.rerun()
 
-    # --- Scrape Button ---
-    if st.button("Start Scraping"):
-        st.session_state.scraped_data = [] # Clear previous results
-        # Create a session for connection pooling and potentially handling cookies
-        session = requests.Session()
-        # Set a common user agent
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'})
+    # --- Progress and Status ---
+    st.progress(st.session_state.scraping_progress)
+    st.info(f"**Status:** {st.session_state.scraping_message}")
+    st.caption(f"*Task:* {st.session_state.current_task}")
 
+    # --- Scrape Execution (in parts based on state) ---
+    if st.session_state.scraping_state == 'running':
         try:
+            # Determine scrape function to call
+            scrape_function = None
+            scrape_args = ()
             if competitor == "RealGroupLinks.com":
                 if target == "Homepage":
-                    st.session_state.scraped_data = scrape_rgl_homepage(REALGROUP_BASE_URL, session)
+                    scrape_function = scrape_rgl_homepage
                 elif target == "Specific Category":
                     if not category_path:
-                        st.error("Please enter a category path.")
+                        st.session_state.scraping_message = "Error: Category path is empty."
+                        st.session_state.scraping_state = 'stopped'
+                        st.rerun()
                         return
                     full_category_url = urljoin(REALGROUP_BASE_URL, category_path)
-                    st.session_state.scraped_data = scrape_rgl_category(full_category_url, session)
-
+                    scrape_function = scrape_rgl_category
+                    scrape_args = (full_category_url,)
             elif competitor == "GroupSor.link":
                 if target == "Search by Keyword":
                     if not search_keyword.strip():
-                        st.error("Please enter a search keyword.")
+                        st.session_state.scraping_message = "Error: Search keyword is empty."
+                        st.session_state.scraping_state = 'stopped'
+                        st.rerun()
                         return
-                    st.session_state.scraped_data = scrape_gs_search(search_keyword.strip(), session)
+                    scrape_function = scrape_gs_search
+                    scrape_args = (search_keyword.strip(),)
+
+            if scrape_function:
+                st.session_state.scraped_data = scrape_function(*scrape_args)
 
             # --- Resolve Intermediate Links ---
-            if resolve_intermediates and st.session_state.scraped_data:
-                st.subheader("Resolving Intermediate Links...")
-                st.session_state.scraped_data = resolve_intermediate_links(st.session_state.scraped_data, session, competitor)
+            if resolve_intermediates and st.session_state.scraped_data and st.session_state.scraping_state == 'running':
+                st.session_state.scraped_data = resolve_intermediate_links(st.session_state.scraped_data, competitor)
 
-            # Deduplicate final results
-            if st.session_state.scraped_data:
-                 unique_results_set = set((item['Type'], item['Source'], item['Link']) for item in st.session_state.scraped_data)
-                 st.session_state.scraped_data = [{"Type": item[0], "Source": item[1], "Link": item[2]} for item in unique_results_set]
-                 st.success(f"Scraping finished! Found {len(st.session_state.scraped_data)} unique items.")
+            # --- Finalize ---
+            if st.session_state.scraping_state == 'running': # Only if finished normally
+                 if st.session_state.scraped_
+                      unique_results_set = set((item['Type'], item['Source'], item['Link']) for item in st.session_state.scraped_data)
+                      st.session_state.scraped_data = [{"Type": item[0], "Source": item[1], "Link": item[2]} for item in unique_results_set]
+                 st.session_state.scraping_message = f"✅ Finished! Found {len(st.session_state.scraped_data)} unique items."
+                 st.session_state.current_task = "Complete."
+                 st.session_state.scraping_state = 'idle' # Reset state
+            elif st.session_state.scraping_state == 'paused':
+                 st.session_state.scraping_message = "⏸️ Paused. Click 'Start' to resume."
+                 st.session_state.current_task = "Paused."
+            elif st.session_state.scraping_state == 'stopped':
+                 # Message already set by stop button
+                 pass
 
         except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-            st.error(f"An unexpected error occurred: {e}")
-        finally:
-            session.close()
+            logger.error(f"An unexpected error occurred during scraping: {e}", exc_info=True)
+            st.session_state.scraping_message = f"💥 Unexpected error: {e}"
+            st.session_state.scraping_state = 'stopped'
+            st.session_state.current_task = "Error."
+        st.rerun() # Re-run to update UI at the end of the scraping process
+
+    # --- Resume Button (only shown when paused) ---
+    if st.session_state.scraping_state == 'paused':
+        st.divider()
+        if st.button("▶️ Resume"):
+            st.session_state.scraping_state = 'running'
+            st.session_state.scraping_message = "Resuming scrape..."
+            st.rerun()
 
     # --- Display Results ---
-    if st.session_state.scraped_data:
-        st.subheader("Scraped Data")
+    if st.session_state.scraped_
+        st.divider()
+        st.subheader("📊 Scraped Data")
         df = pd.DataFrame(st.session_state.scraped_data)
-        st.dataframe(df)
+        st.dataframe(df, use_container_width=True)
 
         # CSV Download
         csv_buffer = io.StringIO()
@@ -413,13 +575,14 @@ def main():
         csv_buffer.close()
 
         st.download_button(
-            label="Download CSV",
+            label="💾 Download CSV",
             data=csv_data,
             file_name='scraped_whatsapp_links.csv',
             mime='text/csv',
         )
     else:
-        st.info("Click 'Start Scraping' to begin.")
+        if st.session_state.scraping_state == 'idle':
+            st.info("Configure options and click 'Start'.")
 
 if __name__ == "__main__":
     main()

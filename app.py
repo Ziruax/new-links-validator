@@ -60,6 +60,7 @@ except Exception as e_general_init:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9"
         }
+
 # --- Streamlit Configuration & Constants ---
 st.set_page_config(
     page_title="WhatsApp Link Scraper & Validator",
@@ -165,6 +166,445 @@ def load_links_from_file(uploaded_file):
 
 # --- Core Logic Functions ---
 
+# --- Updated scrape_whatsapp_links_from_page function ---
+def scrape_whatsapp_links_from_page(url, session=None, wait_for_dynamic=False, wait_time_seconds=5):
+    """Scrapes a single page for WhatsApp links. Optionally waits for dynamic content."""
+    links = set()
+    
+    def _extract_links_from_response(response):
+        """Helper to extract links from a response object."""
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # Method 1: Find <a> tags with href
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag.get('href')
+            if href and href.startswith(WHATSAPP_DOMAIN):
+                parsed_url = urlparse(href)
+                links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
+        # Method 2: Search text content for potential links
+        text_content = soup.get_text()
+        if WHATSAPP_DOMAIN in text_content:
+            for link_url in re.findall(r'(https?://chat\.whatsapp\.com/[^\s"\'<>()\[\]{}]+)', text_content):
+                clean_link = re.sub(r'[.,;!?"\'<>)]+$', '', link_url)
+                clean_link = re.sub(r'(\.[a-zA-Z]{2,4})$', '', clean_link) if not clean_link.endswith(('.html', '.htm', '.php')) else clean_link
+                clean_link = clean_link.split('&')[0] # Often query params are not needed for WA links
+                parsed_url = urlparse(clean_link)
+                if len(parsed_url.path.replace('/', '')) > 15: # Basic sanity check for WA invite ID
+                    links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
+
+    try:
+        headers = get_random_headers_general()
+        response = session.get(url, headers=headers, timeout=15) if session else requests.get(url, headers=headers, timeout=15)
+        response.encoding = 'utf-8'
+        response.raise_for_status()
+        
+        # Extract links from the initial response
+        _extract_links_from_response(response)
+        st.sidebar.info(f"Initial scrape of {url[:50]}... found {len(links)} links.")
+
+        # --- Logic for waiting for dynamic content ---
+        if wait_for_dynamic:
+            # Heuristic: Check if the initial response contains simple timer logic
+            # This is not foolproof but a lightweight check.
+            # A more robust check would be to look for specific JS functions or AJAX calls,
+            # which is much harder without a full JS engine.
+            initial_text_lower = response.text.lower()
+            
+            # Simple check for setTimeout related to showing content or links
+            # (This is a basic example, real-world logic might be more complex)
+            timer_indicators = [
+                'settimeout', # Common JS timer function
+                # Add more specific patterns if you know common ones on target sites
+                # e.g., r'setTimeout.*?display.*?chat\.whatsapp\.com'
+            ]
+            timer_detected = any(indicator in initial_text_lower for indicator in timer_indicators)
+
+            if timer_detected or True: # Always wait if enabled for now, as detection is basic
+                st.sidebar.info(f"Waiting {wait_time_seconds}s for dynamic content on {url[:50]}...")
+                time.sleep(wait_time_seconds)
+                
+                # Fetch the page again after waiting
+                try:
+                    response_after_wait = session.get(url, headers=headers, timeout=15) if session else requests.get(url, headers=headers, timeout=15)
+                    response_after_wait.encoding = 'utf-8'
+                    response_after_wait.raise_for_status()
+                    
+                    # Extract links from the response after waiting
+                    initial_link_count = len(links)
+                    _extract_links_from_response(response_after_wait)
+                    new_links_count = len(links) - initial_link_count
+                    st.sidebar.info(f"After waiting, scrape of {url[:50]}... found {new_links_count} additional links.")
+                except requests.exceptions.RequestException as e_wait:
+                    st.sidebar.warning(f"Error fetching after wait for {url[:50]}: {e_wait}", icon="⏱️")
+                except Exception as e_wait_parse:
+                    st.sidebar.warning(f"Parse error after wait for {url[:50]}: {e_wait_parse}", icon="⏱️")
+            else:
+                st.sidebar.info(f"No simple timer detected on {url[:50]}... Proceeding without wait.")
+
+    except requests.exceptions.Timeout: st.sidebar.warning(f"Scrape Timeout: {url[:50]}...", icon="⏱️")
+    except requests.exceptions.HTTPError as e: st.sidebar.warning(f"Scrape HTTP Err {e.response.status_code}: {url[:50]}...", icon="⚠️")
+    except requests.exceptions.RequestException as e: st.sidebar.warning(f"Scrape Net Err ({type(e).__name__}): {url[:50]}...", icon="⚠️")
+    except Exception as e: st.sidebar.warning(f"Scrape Parse Err ({type(e).__name__}): {url[:50]}...", icon="💣")
+    return list(links)
+
+# --- Google Search Scraper (Updated for concurrency and dynamic wait) ---
+def scrape_single_google_result_page(url_from_google, wait_for_dynamic=False, wait_time_seconds=5):
+    """Wrapper for scraping a single Google result page, used by ThreadPoolExecutor."""
+    try:
+        # Each thread gets its own session for connection pooling within that thread
+        with requests.Session() as session:
+            wa_links_from_page = scrape_whatsapp_links_from_page(url_from_google, session=session, wait_for_dynamic=wait_for_dynamic, wait_time_seconds=wait_time_seconds)
+            return url_from_google, wa_links_from_page
+    except Exception as e:
+        st.sidebar.warning(f"Thread Error scraping {url_from_google[:50]}: {e}", icon="🧵")
+        return url_from_google, []
+
+def google_search_and_scrape(query, top_n=5, wait_for_dynamic=False, wait_time_seconds=5):
+    """Performs Google search and scrapes multiple result pages concurrently."""
+    st.info(f"Googling '{query}' (top {top_n} results)...")
+    all_scraped_wa_links = set()
+    try:
+        search_page_urls = list(google_search_function_actual(query, num_results=top_n, lang="en"))
+        if not search_page_urls:
+            st.warning(f"No Google results for '{query}'. Possible reasons: "
+                       f"1. Query yields no results. "
+                       f"2. Google blocking (try VPN/wait). "
+                       f"3. `googlesearch-python` library issue.", icon="🤔")
+            return []
+        st.success(f"Found {len(search_page_urls)} pages from Google. Scraping them concurrently for WhatsApp links...")
+        prog_bar, stat_txt = st.progress(0), st.empty()
+        successfully_processed = 0
+        # Concurrently scrape the Google result pages
+        with ThreadPoolExecutor(max_workers=MAX_SCRAPING_WORKERS) as executor:
+            # Submit all scraping tasks
+            future_to_url = {executor.submit(scrape_single_google_result_page, url, wait_for_dynamic, wait_time_seconds): url for url in search_page_urls}
+            # Process completed tasks as they finish
+            for i, future in enumerate(as_completed(future_to_url)):
+                url_from_google = future_to_url[future]
+                try:
+                    url_processed, wa_links_from_page = future.result()
+                    newly_found_count = 0
+                    for link in wa_links_from_page:
+                        if link.startswith(WHATSAPP_DOMAIN) and link not in all_scraped_wa_links:
+                            all_scraped_wa_links.add(link)
+                            newly_found_count += 1
+                    if newly_found_count > 0:
+                        st.sidebar.info(f"Found {newly_found_count} new WA links on {url_from_google[:30]}...")
+                    successfully_processed += 1
+                except Exception as e:
+                     st.sidebar.warning(f"Error scraping {url_from_google[:50]}: {e}", icon="⚠️")
+                prog_bar.progress((i + 1) / len(search_page_urls))
+                stat_txt.text(f"Processed {successfully_processed}/{len(search_page_urls)} Google results...")
+        stat_txt.success(f"Scraping of Google results complete. Found {len(all_scraped_wa_links)} unique WhatsApp links from '{query}'.")
+        return list(all_scraped_wa_links)
+    except TypeError as e:
+        st.error(f"Google search TypeError: {e}. Check `googlesearch-python` version/parameters.", icon="❌")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected Google search/scrape error for '{query}': {e}. Check connection/library.", icon="❌")
+        return []
+
+# --- Bulk URL Scraper (Updated for dynamic wait) ---
+def scrape_single_bulk_url(url, wait_for_dynamic=False, wait_time_seconds=5):
+    """Wrapper for scraping a single URL from the bulk list, used by ThreadPoolExecutor."""
+    try:
+        # Each thread gets its own session for connection pooling within that thread
+        with requests.Session() as session:
+            wa_links_from_page = scrape_whatsapp_links_from_page(url, session=session, wait_for_dynamic=wait_for_dynamic, wait_time_seconds=wait_time_seconds)
+            return url, wa_links_from_page
+    except Exception as e:
+        st.sidebar.warning(f"Bulk Scrape Error for {url[:50]}: {e}", icon="🔗")
+        return url, []
+
+def scrape_bulk_urls(list_of_urls, wait_for_dynamic=False, wait_time_seconds=5):
+    """Scrapes a list of URLs concurrently."""
+    if not list_of_urls:
+        st.warning("No URLs provided for bulk scraping.")
+        return set()
+    st.info(f"Starting bulk scrape of {len(list_of_urls)} URLs...")
+    all_scraped_wa_links = set()
+    prog_bar, stat_txt = st.progress(0), st.empty()
+    successfully_processed = 0
+    # Concurrently scrape the URLs
+    with ThreadPoolExecutor(max_workers=MAX_SCRAPING_WORKERS) as executor:
+        # Submit all scraping tasks
+        future_to_url = {executor.submit(scrape_single_bulk_url, url, wait_for_dynamic, wait_time_seconds): url for url in list_of_urls if url.startswith(('http://', 'https://'))}
+        # Process completed tasks as they finish
+        for i, future in enumerate(as_completed(future_to_url)):
+            url_scraped = future_to_url[future]
+            try:
+                url_processed, wa_links_from_page = future.result()
+                newly_found_count = 0
+                for link in wa_links_from_page:
+                    if link.startswith(WHATSAPP_DOMAIN) and link not in all_scraped_wa_links:
+                        all_scraped_wa_links.add(link)
+                        newly_found_count += 1
+                if newly_found_count > 0:
+                    st.sidebar.info(f"Bulk: Found {newly_found_count} new WA links on {url_scraped[:30]}...")
+                successfully_processed += 1
+            except Exception as e:
+                 st.sidebar.warning(f"Error bulk scraping {url_scraped[:50]}: {e}", icon="⚠️")
+            prog_bar.progress((i + 1) / len(future_to_url)) # Use len(future_to_url) in case some URLs were filtered
+            stat_txt.text(f"Bulk Processed {successfully_processed}/{len(future_to_url)} URLs...")
+    stat_txt.success(f"Bulk scraping complete. Found {len(all_scraped_wa_links)} unique WhatsApp links from {len(future_to_url)} URLs.")
+    return all_scraped_wa_links
+
+# --- Crawler Logic ---
+# Define a thread-safe data structure for the crawler's shared state
+from queue import Queue, Empty
+import threading
+from collections import defaultdict
+
+# --- Thread-Safe Crawler State ---
+class ThreadSafeCrawlerState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.visited_urls = set()
+        self.scraped_whatsapp_links = set()
+        self.domain_last_request_time = defaultdict(float) # For politeness per domain
+        self.politeness_delay = 1.0 # seconds between requests to the same domain
+
+    def add_visited_url(self, normalized_url):
+        with self.lock:
+            self.visited_urls.add(normalized_url)
+
+    def is_visited(self, normalized_url):
+        with self.lock:
+            return normalized_url in self.visited_urls
+
+    def add_scraped_link(self, link):
+        with self.lock:
+            if link not in self.scraped_whatsapp_links:
+                self.scraped_whatsapp_links.add(link)
+                return True # Indicating it was new
+            return False
+
+    def get_scraped_links(self):
+        with self.lock:
+            return self.scraped_whatsapp_links.copy()
+
+    def update_last_request_time(self, domain, timestamp):
+        with self.lock:
+            self.domain_last_request_time[domain] = timestamp
+
+    def get_last_request_time(self, domain):
+        with self.lock:
+            return self.domain_last_request_time[domain]
+
+# --- Crawler Worker Thread (Updated for dynamic wait) ---
+def crawler_worker(thread_id, url_queue, state, base_domain, max_depth, session_factory, stop_event, progress_callback, wait_for_dynamic=False, wait_time_seconds=5):
+    """Worker thread function for the crawler."""
+    while not stop_event.is_set():
+        try:
+            # Non-blocking get with timeout to allow checking stop_event
+            current_url, depth = url_queue.get(timeout=1)
+        except Empty:
+            continue # Check stop_event again
+
+        # Check depth limit if it's set (not None)
+        if max_depth is not None and depth > max_depth:
+            url_queue.task_done()
+            continue
+
+        # Normalize URL for visited check
+        normalized_current_url = urljoin(current_url, urlparse(current_url).path or '/')
+
+        # Check if already visited (thread-safe)
+        if state.is_visited(normalized_current_url):
+            url_queue.task_done()
+            continue
+
+        # Mark as visited (thread-safe)
+        state.add_visited_url(normalized_current_url)
+
+        # Politeness delay per domain
+        current_domain = urlparse(current_url).netloc.replace('www.', '')
+        last_req_time = state.get_last_request_time(current_domain)
+        time_since_last = time.time() - last_req_time
+        if time_since_last < state.politeness_delay:
+            time.sleep(state.politeness_delay - time_since_last)
+        state.update_last_request_time(current_domain, time.time())
+
+        # --- Perform the scraping ---
+        try:
+            # Get a new session from the factory for this request
+            with session_factory() as session:
+                # --- Use the updated scraping function with wait option ---
+                wa_links_from_page = scrape_whatsapp_links_from_page(current_url, session=session, wait_for_dynamic=wait_for_dynamic, wait_time_seconds=wait_time_seconds)
+                # --- End of updated scraping call ---
+
+                newly_found_count = 0
+                for link in wa_links_from_page:
+                    if link.startswith(WHATSAPP_DOMAIN):
+                        # Add link (thread-safe)
+                        if state.add_scraped_link(link):
+                            newly_found_count += 1
+                if newly_found_count > 0:
+                    st.sidebar.info(f"T{thread_id}: Found {newly_found_count} new WA links on {current_url[:30]}...")
+
+                progress_callback(thread_id, current_url, depth) # Report progress
+
+                # --- Discover new links to crawl (if within depth limit) ---
+                # Only discover new links if depth limit is not reached (or if it's unlimited)
+                if max_depth is None or depth < max_depth:
+                     # Re-fetch the page content for link discovery if needed, or use the last fetched content
+                     # For simplicity, let's re-fetch if waiting was involved, otherwise use the last result
+                     # Note: scrape_whatsapp_links_from_page doesn't return the full response/soup
+                     # We need to fetch the page content again for parsing links.
+                     # This is a limitation of the current design.
+                     # A better approach would be to refactor scrape_whatsapp_links_from_page to also return the soup
+                     # or make link discovery a separate step.
+                     try:
+                         response_for_links = session.get(current_url, headers=get_random_headers_general(), timeout=10)
+                         response_for_links.raise_for_status()
+                         if 'text/html' not in response_for_links.headers.get('Content-Type', '').lower():
+                             url_queue.task_done()
+                             continue
+                         soup = BeautifulSoup(response_for_links.text, 'html.parser')
+                         for link_tag in soup.find_all('a', href=True):
+                             href = link_tag.get('href')
+                             if href:
+                                 abs_url = urljoin(current_url, href)
+                                 parsed_abs_url = urlparse(abs_url)
+                                 # Check if it's an internal link to the same domain
+                                 if (parsed_abs_url.scheme in ['http', 'https'] and
+                                     parsed_abs_url.netloc.replace('www.', '') == base_domain and
+                                     not parsed_abs_url.fragment):
+                                     normalized_abs_url = urljoin(abs_url, parsed_abs_url.path or '/')
+                                     # Check if already visited or queued (basic check, queue isn't fully thread-safe here without more complexity)
+                                     # A more robust crawler might use a separate thread-safe set for 'seen' URLs to add to the queue.
+                                     if not state.is_visited(normalized_abs_url):
+                                         # Add to queue for other workers
+                                         url_queue.put((abs_url, depth + 1))
+                     except requests.exceptions.RequestException as e_links:
+                         st.sidebar.warning(f"T{thread_id}: Link Discovery Req Err ({type(e_links).__name__}): {current_url[:50]}...", icon="🕸️")
+                     except Exception as e_links_parse:
+                         st.sidebar.error(f"T{thread_id}: Link Discovery Parse Err ({type(e_links_parse).__name__}): {current_url[:50]}...", icon="💥")
+
+        except requests.exceptions.RequestException as e:
+            st.sidebar.warning(f"T{thread_id}: Crawl Req Err ({type(e).__name__}): {current_url[:50]}...", icon="🕸️")
+        except Exception as e:
+            st.sidebar.error(f"T{thread_id}: Crawl Parse Err ({type(e).__name__}): {current_url[:50]}...", icon="💥")
+        finally:
+            url_queue.task_done()
+
+def crawl_website(start_url, max_depth=None, max_pages=1000000, wait_for_dynamic=False, wait_time_seconds=5):
+    """Crawls a website concurrently using multiple threads.
+    Args:
+        start_url (str): The initial URL to start crawling from.
+        max_depth (int, optional): Maximum depth to crawl. If None, depth is unlimited.
+        max_pages (int, optional): Maximum number of pages to crawl. Defaults to 1000000 (effectively unlimited).
+        wait_for_dynamic (bool): Whether to wait for dynamic content.
+        wait_time_seconds (int): Time to wait if waiting for dynamic content.
+    Returns:
+        set: A set of unique WhatsApp links found during the crawl.
+    """
+    scraped_whatsapp_links = set()
+    if not start_url.strip():
+        return scraped_whatsapp_links
+    if not start_url.startswith(('http://', 'https://')):
+        start_url = 'https://' + start_url
+        st.sidebar.warning(f"Prepending 'https://': {start_url}", icon="🔗")
+    try:
+        parsed_start_url = urlparse(start_url)
+    except Exception as pe:
+        st.sidebar.error(f"Invalid start URL format: {start_url} - {pe}", icon="🚫")
+        return scraped_whatsapp_links
+    if not parsed_start_url.netloc:
+        st.sidebar.error(f"Invalid start URL: {start_url}", icon="🚫")
+        return scraped_whatsapp_links
+    base_domain = parsed_start_url.netloc.replace('www.', '')
+
+    # Initialize thread-safe state
+    crawler_state = ThreadSafeCrawlerState()
+
+    # Create a queue for URLs to be crawled
+    url_queue = Queue()
+    url_queue.put((start_url, 0)) # Add the starting URL with depth 0
+
+    # Event to signal threads to stop
+    stop_event = threading.Event()
+
+    # Progress tracking variables
+    page_count = 0
+    progress_lock = threading.Lock() # Lock for updating shared progress variables
+
+    def progress_callback(thread_id, url, depth):
+        nonlocal page_count
+        with progress_lock:
+            page_count += 1
+            current_page_count = page_count
+            current_queue_size = url_queue.qsize()
+        st.sidebar.text(f"T{thread_id} (D:{depth},P:{current_page_count},Q:{current_queue_size}): {url[:50]}...")
+        # Check stop conditions based on max_pages
+        if current_page_count >= max_pages:
+             stop_event.set()
+             st.sidebar.warning(f"Reached max pages limit ({max_pages}). Stopping crawl.", icon="🛑")
+
+    # Session factory to create new sessions for threads
+    def session_factory():
+        session = requests.Session()
+        # Optional: Add retry strategy for robustness
+        # from requests.adapters import HTTPAdapter
+        # from urllib3.util.retry import Retry
+        # retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        # adapter = HTTPAdapter(max_retries=retry_strategy)
+        # session.mount("http://", adapter)
+        # session.mount("https://", adapter)
+        return session
+
+    # Create and start worker threads
+    num_threads = min(MAX_SCRAPING_WORKERS, 4) # Limit crawler threads more conservatively
+    threads = []
+    for i in range(num_threads):
+        # Pass wait parameters to the worker
+        t = threading.Thread(target=crawler_worker, args=(i, url_queue, crawler_state, base_domain, max_depth, session_factory, stop_event, progress_callback, wait_for_dynamic, wait_time_seconds))
+        t.start()
+        threads.append(t)
+        # Slight stagger start to avoid initial burst
+        time.sleep(0.05)
+
+    # Wait for all tasks in the queue to be processed or stop event
+    try:
+        # Main waiting loop while threads are working or items are in the queue
+        last_check_time = time.time()
+        while not stop_event.is_set():
+            # Check periodically if queue is empty and threads seem idle
+            time.sleep(1)
+            current_time = time.time()
+            # Check every few seconds
+            if current_time - last_check_time > 3:
+                if url_queue.empty():
+                    # Give threads a moment to finish current tasks or add new URLs
+                    time.sleep(1.5)
+                    if url_queue.empty():
+                         # Likely done or stalled
+                         break
+                last_check_time = current_time
+    except KeyboardInterrupt:
+        st.sidebar.error("Crawl interrupted by user (Ctrl+C).", icon="🛑")
+        stop_event.set()
+    except Exception as general_crawl_wait_error:
+         st.sidebar.error(f"Unexpected error during crawl wait: {general_crawl_wait_error}", icon="💥")
+         stop_event.set()
+
+    # Signal threads to stop if they haven't already
+    stop_event.set()
+
+    # Wait for threads to finish gracefully (with timeout)
+    for t in threads:
+        t.join(timeout=5) # Give them a timeout to finish
+
+    # Get final results from the thread-safe state
+    scraped_whatsapp_links = crawler_state.get_scraped_links()
+    final_msg = f"Crawl finished. Scraped approx {page_count} pages, found {len(scraped_whatsapp_links)} links."
+    if page_count >= max_pages:
+        final_msg += f" Stopped at {max_pages} pages limit."
+    if max_depth is not None:
+        final_msg += f" Max depth was {max_depth}."
+    st.sidebar.success(final_msg)
+    return scraped_whatsapp_links
+# --- End of Crawler Logic ---
+
 def validate_link(link):
     # Initialize with empty group name
     result = {"Group Name": UNNAMED_GROUP_PLACEHOLDER, "Group Link": link, "Logo URL": "", "Status": "Error"}
@@ -219,403 +659,12 @@ def validate_link(link):
     except requests.exceptions.Timeout: result["Status"] = "Timeout Error"
     except requests.exceptions.ConnectionError: result["Status"] = "Connection Error"
     except requests.exceptions.RequestException as e: result["Status"] = f"Network Error ({type(e).__name__})"
-    except Exception as e: 
+    except Exception as e:
         result["Status"] = f"Parsing Error ({type(e).__name__})"
         # Apply rule after exception
         if not result["Group Name"].strip():
             result["Status"] = "Expire"
     return result
-
-def scrape_whatsapp_links_from_page(url, session=None):
-    """Scrapes a single page for WhatsApp links. Used by various scrapers."""
-    links = set()
-    try:
-        headers = get_random_headers_general()
-        response = session.get(url, headers=headers, timeout=15) if session else requests.get(url, headers=headers, timeout=15)
-        response.encoding = 'utf-8'
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        # Method 1: Find <a> tags with href
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag.get('href')
-            if href and href.startswith(WHATSAPP_DOMAIN):
-                parsed_url = urlparse(href)
-                links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
-        # Method 2: Search text content for potential links
-        text_content = soup.get_text()
-        if WHATSAPP_DOMAIN in text_content:
-            for link_url in re.findall(r'(https?://chat\.whatsapp\.com/[^\s"\'<>()\[\]{}]+)', text_content):
-                clean_link = re.sub(r'[.,;!?"\'<>)]+$', '', link_url)
-                clean_link = re.sub(r'(\.[a-zA-Z]{2,4})$', '', clean_link) if not clean_link.endswith(('.html', '.htm', '.php')) else clean_link
-                clean_link = clean_link.split('&')[0] # Often query params are not needed for WA links
-                parsed_url = urlparse(clean_link)
-                if len(parsed_url.path.replace('/', '')) > 15: # Basic sanity check for WA invite ID
-                    links.add(f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}")
-    except requests.exceptions.Timeout: st.sidebar.warning(f"Scrape Timeout: {url[:50]}...", icon="⏱️")
-    except requests.exceptions.HTTPError as e: st.sidebar.warning(f"Scrape HTTP Err {e.response.status_code}: {url[:50]}...", icon="⚠️")
-    except requests.exceptions.RequestException as e: st.sidebar.warning(f"Scrape Net Err ({type(e).__name__}): {url[:50]}...", icon="⚠️")
-    except Exception as e: st.sidebar.warning(f"Scrape Parse Err ({type(e).__name__}): {url[:50]}...", icon="💣")
-    return list(links)
-
-# --- Google Search Scraper (Updated for concurrency) ---
-def scrape_single_google_result_page(url_from_google):
-    """Wrapper for scraping a single Google result page, used by ThreadPoolExecutor."""
-    try:
-        # Each thread gets its own session for connection pooling within that thread
-        with requests.Session() as session:
-            wa_links_from_page = scrape_whatsapp_links_from_page(url_from_google, session=session)
-            return url_from_google, wa_links_from_page
-    except Exception as e:
-        st.sidebar.warning(f"Thread Error scraping {url_from_google[:50]}: {e}", icon="🧵")
-        return url_from_google, []
-
-def google_search_and_scrape(query, top_n=5):
-    """Performs Google search and scrapes multiple result pages concurrently."""
-    st.info(f"Googling '{query}' (top {top_n} results)...")
-    all_scraped_wa_links = set()
-    try:
-        search_page_urls = list(google_search_function_actual(query, num_results=top_n, lang="en"))
-        if not search_page_urls:
-            st.warning(f"No Google results for '{query}'. Possible reasons: "
-                       f"1. Query yields no results. "
-                       f"2. Google blocking (try VPN/wait). "
-                       f"3. `googlesearch-python` library issue.", icon="🤔")
-            return []
-        st.success(f"Found {len(search_page_urls)} pages from Google. Scraping them concurrently for WhatsApp links...")
-
-        prog_bar, stat_txt = st.progress(0), st.empty()
-        successfully_processed = 0
-        
-        # Concurrently scrape the Google result pages
-        with ThreadPoolExecutor(max_workers=MAX_SCRAPING_WORKERS) as executor:
-            # Submit all scraping tasks
-            future_to_url = {executor.submit(scrape_single_google_result_page, url): url for url in search_page_urls}
-            
-            # Process completed tasks as they finish
-            for i, future in enumerate(as_completed(future_to_url)):
-                url_from_google = future_to_url[future]
-                try:
-                    url_processed, wa_links_from_page = future.result()
-                    newly_found_count = 0
-                    for link in wa_links_from_page:
-                        if link.startswith(WHATSAPP_DOMAIN) and link not in all_scraped_wa_links:
-                            all_scraped_wa_links.add(link)
-                            newly_found_count += 1
-                    if newly_found_count > 0:
-                        st.sidebar.info(f"Found {newly_found_count} new WA links on {url_from_google[:30]}...")
-                    successfully_processed += 1
-                except Exception as e:
-                     st.sidebar.warning(f"Error scraping {url_from_google[:50]}: {e}", icon="⚠️")
-                
-                prog_bar.progress((i + 1) / len(search_page_urls))
-                stat_txt.text(f"Processed {successfully_processed}/{len(search_page_urls)} Google results...")
-
-        stat_txt.success(f"Scraping of Google results complete. Found {len(all_scraped_wa_links)} unique WhatsApp links from '{query}'.")
-        return list(all_scraped_wa_links)
-    except TypeError as e:
-        st.error(f"Google search TypeError: {e}. Check `googlesearch-python` version/parameters.", icon="❌")
-        return []
-    except Exception as e:
-        st.error(f"Unexpected Google search/scrape error for '{query}': {e}. Check connection/library.", icon="❌")
-        return []
-
-# --- Bulk URL Scraper ---
-def scrape_single_bulk_url(url):
-    """Wrapper for scraping a single URL from the bulk list, used by ThreadPoolExecutor."""
-    try:
-        # Each thread gets its own session for connection pooling within that thread
-        with requests.Session() as session:
-            wa_links_from_page = scrape_whatsapp_links_from_page(url, session=session)
-            return url, wa_links_from_page
-    except Exception as e:
-        st.sidebar.warning(f"Bulk Scrape Error for {url[:50]}: {e}", icon="🔗")
-        return url, []
-
-def scrape_bulk_urls(list_of_urls):
-    """Scrapes a list of URLs concurrently."""
-    if not list_of_urls:
-        st.warning("No URLs provided for bulk scraping.")
-        return set()
-    st.info(f"Starting bulk scrape of {len(list_of_urls)} URLs...")
-    all_scraped_wa_links = set()
-    
-    prog_bar, stat_txt = st.progress(0), st.empty()
-    successfully_processed = 0
-
-    # Concurrently scrape the URLs
-    with ThreadPoolExecutor(max_workers=MAX_SCRAPING_WORKERS) as executor:
-        # Submit all scraping tasks
-        future_to_url = {executor.submit(scrape_single_bulk_url, url): url for url in list_of_urls if url.startswith(('http://', 'https://'))}
-        
-        # Process completed tasks as they finish
-        for i, future in enumerate(as_completed(future_to_url)):
-            url_scraped = future_to_url[future]
-            try:
-                url_processed, wa_links_from_page = future.result()
-                newly_found_count = 0
-                for link in wa_links_from_page:
-                    if link.startswith(WHATSAPP_DOMAIN) and link not in all_scraped_wa_links:
-                        all_scraped_wa_links.add(link)
-                        newly_found_count += 1
-                if newly_found_count > 0:
-                    st.sidebar.info(f"Bulk: Found {newly_found_count} new WA links on {url_scraped[:30]}...")
-                successfully_processed += 1
-            except Exception as e:
-                 st.sidebar.warning(f"Error bulk scraping {url_scraped[:50]}: {e}", icon="⚠️")
-            
-            prog_bar.progress((i + 1) / len(future_to_url)) # Use len(future_to_url) in case some URLs were filtered
-            stat_txt.text(f"Bulk Processed {successfully_processed}/{len(future_to_url)} URLs...")
-
-    stat_txt.success(f"Bulk scraping complete. Found {len(all_scraped_wa_links)} unique WhatsApp links from {len(future_to_url)} URLs.")
-    return all_scraped_wa_links
-
-# --- Crawler Logic ---
-# Define a thread-safe data structure for the crawler's shared state
-from queue import Queue, Empty
-import threading
-from collections import defaultdict
-
-# --- Thread-Safe Crawler State ---
-class ThreadSafeCrawlerState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.visited_urls = set()
-        self.scraped_whatsapp_links = set()
-        self.domain_last_request_time = defaultdict(float) # For politeness per domain
-        self.politeness_delay = 1.0 # seconds between requests to the same domain
-
-    def add_visited_url(self, normalized_url):
-        with self.lock:
-            self.visited_urls.add(normalized_url)
-
-    def is_visited(self, normalized_url):
-        with self.lock:
-            return normalized_url in self.visited_urls
-
-    def add_scraped_link(self, link):
-        with self.lock:
-            if link not in self.scraped_whatsapp_links:
-                self.scraped_whatsapp_links.add(link)
-                return True # Indicating it was new
-            return False
-
-    def get_scraped_links(self):
-        with self.lock:
-            return self.scraped_whatsapp_links.copy()
-
-    def update_last_request_time(self, domain, timestamp):
-        with self.lock:
-            self.domain_last_request_time[domain] = timestamp
-
-    def get_last_request_time(self, domain):
-        with self.lock:
-            return self.domain_last_request_time[domain]
-
-# --- Crawler Worker Thread ---
-def crawler_worker(thread_id, url_queue, state, base_domain, max_depth, session_factory, stop_event, progress_callback):
-    """Worker thread function for the crawler."""
-    while not stop_event.is_set():
-        try:
-            # Non-blocking get with timeout to allow checking stop_event
-            current_url, depth = url_queue.get(timeout=1)
-        except Empty:
-            continue # Check stop_event again
-
-        # Check depth limit if it's set (not None)
-        if max_depth is not None and depth > max_depth:
-            url_queue.task_done()
-            continue
-
-        # Normalize URL for visited check
-        normalized_current_url = urljoin(current_url, urlparse(current_url).path or '/')
-
-        # Check if already visited (thread-safe)
-        if state.is_visited(normalized_current_url):
-            url_queue.task_done()
-            continue
-
-        # Mark as visited (thread-safe)
-        state.add_visited_url(normalized_current_url)
-
-        # Politeness delay per domain
-        current_domain = urlparse(current_url).netloc.replace('www.', '')
-        last_req_time = state.get_last_request_time(current_domain)
-        time_since_last = time.time() - last_req_time
-        if time_since_last < state.politeness_delay:
-            time.sleep(state.politeness_delay - time_since_last)
-        state.update_last_request_time(current_domain, time.time())
-
-        # --- Perform the scraping ---
-        try:
-            # Get a new session from the factory for this request
-            with session_factory() as session:
-                response = session.get(current_url, headers=get_random_headers_general(), timeout=10)
-                response.raise_for_status()
-                if 'text/html' not in response.headers.get('Content-Type', '').lower(): 
-                    url_queue.task_done()
-                    continue
-                
-                progress_callback(thread_id, current_url, depth) # Report progress
-                
-                # Scrape links from the page
-                wa_links_from_page = scrape_whatsapp_links_from_page(current_url, session=session)
-                newly_found_count = 0
-                for link in wa_links_from_page:
-                    if link.startswith(WHATSAPP_DOMAIN):
-                        # Add link (thread-safe)
-                        if state.add_scraped_link(link):
-                            newly_found_count += 1
-                
-                if newly_found_count > 0:
-                    st.sidebar.info(f"T{thread_id}: Found {newly_found_count} new WA links on {current_url[:30]}...")
-
-                # --- Discover new links to crawl (if within depth limit) ---
-                # Only discover new links if depth limit is not reached (or if it's unlimited)
-                if max_depth is None or depth < max_depth:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    for link_tag in soup.find_all('a', href=True):
-                        href = link_tag.get('href')
-                        if href:
-                            abs_url = urljoin(current_url, href)
-                            parsed_abs_url = urlparse(abs_url)
-                            # Check if it's an internal link to the same domain
-                            if (parsed_abs_url.scheme in ['http', 'https'] and 
-                                parsed_abs_url.netloc.replace('www.', '') == base_domain and 
-                                not parsed_abs_url.fragment):
-                                
-                                normalized_abs_url = urljoin(abs_url, parsed_abs_url.path or '/')
-                                # Check if already visited or queued (basic check, queue isn't fully thread-safe here without more complexity)
-                                # A more robust crawler might use a separate thread-safe set for 'seen' URLs to add to the queue.
-                                if not state.is_visited(normalized_abs_url): 
-                                    # Add to queue for other workers
-                                    url_queue.put((abs_url, depth + 1))
-
-        except requests.exceptions.RequestException as e: 
-            st.sidebar.warning(f"T{thread_id}: Crawl Req Err ({type(e).__name__}): {current_url[:50]}...", icon="🕸️")
-        except Exception as e: 
-            st.sidebar.error(f"T{thread_id}: Crawl Parse Err ({type(e).__name__}): {current_url[:50]}...", icon="💥")
-        finally:
-            url_queue.task_done()
-
-def crawl_website(start_url, max_depth=None, max_pages=1000000):
-    """Crawls a website concurrently using multiple threads.
-    Args:
-        start_url (str): The initial URL to start crawling from.
-        max_depth (int, optional): Maximum depth to crawl. If None, depth is unlimited.
-        max_pages (int, optional): Maximum number of pages to crawl. Defaults to 1000000 (effectively unlimited).
-    Returns:
-        set: A set of unique WhatsApp links found during the crawl.
-    """
-    scraped_whatsapp_links = set()
-    if not start_url.strip():
-        return scraped_whatsapp_links
-    if not start_url.startswith(('http://', 'https://')):
-        start_url = 'https://' + start_url
-        st.sidebar.warning(f"Prepending 'https://': {start_url}", icon="🔗")
-    try:
-        parsed_start_url = urlparse(start_url)
-    except Exception as pe:
-        st.sidebar.error(f"Invalid start URL format: {start_url} - {pe}", icon="🚫")
-        return scraped_whatsapp_links
-
-    if not parsed_start_url.netloc:
-        st.sidebar.error(f"Invalid start URL: {start_url}", icon="🚫")
-        return scraped_whatsapp_links
-    base_domain = parsed_start_url.netloc.replace('www.', '')
-
-    # Initialize thread-safe state
-    crawler_state = ThreadSafeCrawlerState()
-
-    # Create a queue for URLs to be crawled
-    url_queue = Queue()
-    url_queue.put((start_url, 0)) # Add the starting URL with depth 0
-
-    # Event to signal threads to stop
-    stop_event = threading.Event()
-
-    # Progress tracking variables
-    page_count = 0
-    progress_lock = threading.Lock() # Lock for updating shared progress variables
-
-    def progress_callback(thread_id, url, depth):
-        nonlocal page_count
-        with progress_lock:
-            page_count += 1
-            current_page_count = page_count
-            current_queue_size = url_queue.qsize()
-        st.sidebar.text(f"T{thread_id} (D:{depth},P:{current_page_count},Q:{current_queue_size}): {url[:50]}...")
-        # Check stop conditions based on max_pages
-        if current_page_count >= max_pages:
-             stop_event.set()
-             st.sidebar.warning(f"Reached max pages limit ({max_pages}). Stopping crawl.", icon="🛑")
-
-    # Session factory to create new sessions for threads
-    def session_factory():
-        session = requests.Session()
-        # Optional: Add retry strategy for robustness
-        # from requests.adapters import HTTPAdapter
-        # from urllib3.util.retry import Retry
-        # retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        # adapter = HTTPAdapter(max_retries=retry_strategy)
-        # session.mount("http://", adapter)
-        # session.mount("https://", adapter)
-        return session
-
-    # Create and start worker threads
-    num_threads = min(MAX_SCRAPING_WORKERS, 4) # Limit crawler threads more conservatively
-    threads = []
-    for i in range(num_threads):
-        t = threading.Thread(target=crawler_worker, args=(i, url_queue, crawler_state, base_domain, max_depth, session_factory, stop_event, progress_callback))
-        t.start()
-        threads.append(t)
-        # Slight stagger start to avoid initial burst
-        time.sleep(0.05)
-
-    # Wait for all tasks in the queue to be processed or stop event
-    try:
-        # Main waiting loop while threads are working or items are in the queue
-        last_check_time = time.time()
-        while not stop_event.is_set():
-            # Check periodically if queue is empty and threads seem idle
-            time.sleep(1)
-            current_time = time.time()
-            # Check every few seconds
-            if current_time - last_check_time > 3:
-                if url_queue.empty():
-                    # Give threads a moment to finish current tasks or add new URLs
-                    time.sleep(1.5)
-                    if url_queue.empty():
-                         # Likely done or stalled
-                         break
-                last_check_time = current_time
-
-    except KeyboardInterrupt:
-        st.sidebar.error("Crawl interrupted by user (Ctrl+C).", icon="🛑")
-        stop_event.set()
-    except Exception as general_crawl_wait_error:
-         st.sidebar.error(f"Unexpected error during crawl wait: {general_crawl_wait_error}", icon="💥")
-         stop_event.set()
-
-    # Signal threads to stop if they haven't already
-    stop_event.set()
-
-    # Wait for threads to finish gracefully (with timeout)
-    for t in threads:
-        t.join(timeout=5) # Give them a timeout to finish
-
-    # Get final results from the thread-safe state
-    scraped_whatsapp_links = crawler_state.get_scraped_links()
-
-    final_msg = f"Crawl finished. Scraped approx {page_count} pages, found {len(scraped_whatsapp_links)} links."
-    if page_count >= max_pages:
-        final_msg += f" Stopped at {max_pages} pages limit."
-    if max_depth is not None:
-        final_msg += f" Max depth was {max_depth}."
-
-    st.sidebar.success(final_msg)
-    return scraped_whatsapp_links
-
-# --- End of Crawler Logic ---
 
 def generate_styled_html_table(data_df_for_table):
     df_to_display = data_df_for_table[data_df_for_table['Group Name'] != UNNAMED_GROUP_PLACEHOLDER].copy()
@@ -657,15 +706,16 @@ def generate_styled_html_table(data_df_for_table):
 def main():
     st.markdown('<h1 class="main-title">WhatsApp Link Scraper & Validator 🚀</h1>', unsafe_allow_html=True)
     st.markdown('<p class="subtitle">Discover, Scrape, Validate, and Manage WhatsApp Group Links with Enhanced Filtering.</p>', unsafe_allow_html=True)
+
     # Initialize session state
     if 'results' not in st.session_state: st.session_state.results = []
     if 'processed_links_in_session' not in st.session_state: st.session_state.processed_links_in_session = set()
     if 'styled_table_name_keywords' not in st.session_state: st.session_state.styled_table_name_keywords = ""
     if 'styled_table_current_limit_value' not in st.session_state: st.session_state.styled_table_current_limit_value = 50
     # Set "Active" as default filter for advanced filtering
-    if 'adv_filter_status' not in st.session_state: 
+    if 'adv_filter_status' not in st.session_state:
         st.session_state.adv_filter_status = ["Active"]
-    if 'adv_filter_name_keywords' not in st.session_state: 
+    if 'adv_filter_name_keywords' not in st.session_state:
         st.session_state.adv_filter_name_keywords = ""
     # Ensure processed_links_in_session is a set and populate it
     if not isinstance(st.session_state.processed_links_in_session, set):
@@ -679,6 +729,7 @@ def main():
                     st.session_state.processed_links_in_session.add(normalized_link)
                 except Exception:
                     st.session_state.processed_links_in_session.add(res_item['Group Link'])
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Input & Settings")
@@ -688,10 +739,33 @@ def main():
             "Scrape from Entire Website (Extensive Crawl)",
             "Enter Links Manually (for Validation)", "Upload Link File (TXT/CSV/Excel - Validation)"
         ], key="input_method_main_select")
+
+        # --- New Settings for Dynamic Content Handling ---
+        st.markdown("---")
+        st.subheader("🔄 Dynamic Content Handling")
+        wait_for_dynamic_content = st.checkbox(
+            "Wait for Dynamic Content (e.g., Timers)",
+            value=False,
+            key="wait_for_dynamic_checkbox",
+            help="Enable this if target pages load links after a delay using JavaScript. Increases scrape time."
+        )
+        wait_time_seconds = 5
+        if wait_for_dynamic_content:
+            wait_time_seconds = st.slider(
+                "Wait Time (seconds):",
+                min_value=1,
+                max_value=30,
+                value=5,
+                step=1,
+                key="wait_time_slider",
+                help="How long to wait before scraping the page again."
+            )
+        # --- End of New Settings ---
+
         gs_top_n = 5
         if input_method in ["Search and Scrape from Google", "Search & Scrape from Google (Bulk via Excel)", "Upload Link File (TXT/CSV/Excel - Validation)"]:
             gs_top_n = st.slider("Google Results to Scrape (per keyword)", 1, 20, 5, key="gs_top_n_slider", help="Number of Google search result pages to analyze per keyword.")
-        
+
         # --- Updated Crawl Settings UI ---
         crawl_depth, crawl_pages = None, 1000000 # Defaults for unlimited
         if input_method == "Scrape from Entire Website (Extensive Crawl)":
@@ -705,7 +779,6 @@ def main():
             )
             if crawl_depth_option == "Set Depth Limit":
                 crawl_depth = st.slider("Max Crawl Depth", 0, 10, 2, key="crawl_depth_slider")
-
             # Use a very high default for pages, effectively unlimited unless changed.
             crawl_pages_option = st.radio(
                 "Crawl Page Limit:",
@@ -715,10 +788,8 @@ def main():
             )
             if crawl_pages_option == "Set Page Limit":
                 crawl_pages = st.slider("Max Pages to Crawl", 1, 50000, 1000, step=100, key="crawl_pages_slider")
-
             st.markdown("---")
             st.warning("⚠️ Unlimited crawl can take a very long time and consume significant resources. Ensure the target site allows crawling. Consider setting limits.", icon="🚨")
-
         st.markdown("---")
         if st.button("🗑️ Clear All Results & Reset Filters", use_container_width=True, key="clear_all_button"):
             st.session_state.results, st.session_state.processed_links_in_session = [], set()
@@ -727,6 +798,7 @@ def main():
             st.session_state.adv_filter_status = ["Active"]  # Reset to default "Active"
             st.session_state.adv_filter_name_keywords = ""
             st.cache_data.clear(); st.success("Results & filters cleared!"); st.rerun()
+
     # Action Zone
     current_action_scraped_links = set()
     st.subheader(f"🚀 Action Zone: {input_method}")
@@ -734,7 +806,9 @@ def main():
         if input_method == "Search and Scrape from Google":
             query = st.text_input("Search Query:", placeholder="e.g., Islamic WhatsApp group", key="gs_query_input")
             if st.button("Search, Scrape & Validate", use_container_width=True, key="gs_button"):
-                if query: current_action_scraped_links.update(google_search_and_scrape(query, gs_top_n))
+                if query:
+                    # Pass wait parameters
+                    current_action_scraped_links.update(google_search_and_scrape(query, gs_top_n, wait_for_dynamic_content, wait_time_seconds))
                 else: st.warning("Please enter a search query.")
         elif input_method == "Search & Scrape from Google (Bulk via Excel)":
             file = st.file_uploader("Upload Excel (keywords in 1st col)", type=["xlsx"], key="gs_bulk_excel_upload")
@@ -746,7 +820,8 @@ def main():
                     total_l = 0
                     for i, kw in enumerate(keywords):
                         stat_b.text(f"Keyword: '{kw}' ({i+1}/{len(keywords)}). Total links: {total_l}")
-                        links_from_kw = google_search_and_scrape(kw, gs_top_n)
+                        # Pass wait parameters
+                        links_from_kw = google_search_and_scrape(kw, gs_top_n, wait_for_dynamic_content, wait_time_seconds)
                         current_action_scraped_links.update(links_from_kw)
                         total_l = len(current_action_scraped_links)
                         prog_b.progress((i+1)/len(keywords))
@@ -757,8 +832,8 @@ def main():
             if st.button("Scrape Page & Validate", use_container_width=True, key="specific_url_button"):
                 if url and (url.startswith("http://") or url.startswith("https://")):
                     with st.spinner(f"Scraping {url}..."):
-                        # This part is still single-threaded as it scrapes one URL
-                        current_action_scraped_links.update(scrape_whatsapp_links_from_page(url))
+                        # Pass wait parameters
+                        current_action_scraped_links.update(scrape_whatsapp_links_from_page(url, wait_for_dynamic=wait_for_dynamic_content, wait_time_seconds=wait_time_seconds))
                     st.success(f"Scraping done. Found {len(current_action_scraped_links)} links.")
                 else: st.warning("Please enter a valid URL.")
         # --- New Bulk URL Scraping Feature ---
@@ -777,10 +852,10 @@ def main():
                     except Exception as e_excel:
                         st.error(f"Error reading Excel for URLs: {e_excel}", icon="❌")
                         urls_to_scrape = []
-
                 if urls_to_scrape:
                     st.info(f"Loaded {len(urls_to_scrape)} URLs. Starting concurrent scrape...")
-                    current_action_scraped_links.update(scrape_bulk_urls(urls_to_scrape))
+                    # Pass wait parameters
+                    current_action_scraped_links.update(scrape_bulk_urls(urls_to_scrape, wait_for_dynamic_content, wait_time_seconds))
                 else:
                     st.warning("No valid URLs found in the uploaded file.")
         elif input_method == "Scrape from Entire Website (Extensive Crawl)":
@@ -788,7 +863,8 @@ def main():
             if st.button("Crawl & Scrape", use_container_width=True, key="crawl_button"):
                 if domain:
                     st.info("Starting crawl. Progress in sidebar.")
-                    current_action_scraped_links.update(crawl_website(domain, crawl_depth, crawl_pages))
+                    # Pass wait parameters
+                    current_action_scraped_links.update(crawl_website(domain, crawl_depth, crawl_pages, wait_for_dynamic_content, wait_time_seconds))
                     st.success(f"Crawl done. Found {len(current_action_scraped_links)} links.")
                 else: st.warning("Please enter a domain.")
         elif input_method == "Enter Links Manually (for Validation)":
@@ -811,7 +887,8 @@ def main():
                         total_le = 0
                         for i, kw in enumerate(keywords):
                             stat_e.text(f"Keyword: {kw} ({i+1}/{len(keywords)}). Links: {total_le}")
-                            links_from_kw = google_search_and_scrape(kw, gs_top_n)
+                            # Pass wait parameters
+                            links_from_kw = google_search_and_scrape(kw, gs_top_n, wait_for_dynamic_content, wait_time_seconds)
                             current_action_scraped_links.update(links_from_kw)
                             total_le = len(current_action_scraped_links)
                             prog_e.progress((i+1)/len(keywords))
@@ -827,6 +904,7 @@ def main():
                     else: st.warning("No links in file.")
                 else: st.warning("Unsupported file. Use .txt, .csv, or .xlsx.")
     except Exception as e: st.error(f"Input/Scraping Error: {e}", icon="💥")
+
     # Validation
     links_to_validate_now = list(current_action_scraped_links - st.session_state.processed_links_in_session)
     if links_to_validate_now:
@@ -856,22 +934,26 @@ def main():
         stat_val.success(f"Validation complete for {len(links_to_validate_now)} new links!")
     elif current_action_scraped_links and not links_to_validate_now:
         st.info("No *new* WhatsApp links found from this action. All were previously processed.")
+
     # Results Display
     if 'results' in st.session_state and st.session_state.results:
         unique_results_df = pd.DataFrame(st.session_state.results).drop_duplicates(subset=['Group Link'], keep='first')
         st.session_state.results = unique_results_df.to_dict('records')
         df_display_master = unique_results_df.reset_index(drop=True)
+
         # Updated status handling to include "Expire"
         condition_expired = (df_display_master['Status'].str.startswith('Expired')) | (df_display_master['Status'] == 'Expire')
         active_df_all_master = df_display_master[df_display_master['Status'] == 'Active'].copy()
         expired_df_master = df_display_master[condition_expired].copy()
         error_df_master = df_display_master[~condition_expired & (df_display_master['Status'] != 'Active')].copy()
+
         st.subheader("📊 Results Summary")
         col1, col2, col3, col4 = st.columns(4)
         col1.markdown(f'<div class="metric-card">Total Processed<br><div class="metric-value">{len(df_display_master)}</div></div>', unsafe_allow_html=True)
         col2.markdown(f'<div class="metric-card">Active Links<br><div class="metric-value">{len(active_df_all_master)}</div></div>', unsafe_allow_html=True)
         col3.markdown(f'<div class="metric-card">Expired/Expire Links<br><div class="metric-value">{len(expired_df_master)}</div></div>', unsafe_allow_html=True)
         col4.markdown(f'<div class="metric-card">Other Status<br><div class="metric-value">{len(error_df_master)}</div></div>', unsafe_allow_html=True)
+
         # Styled Table with Filters
         st.subheader("✨ Active Groups Display (Styled Table)")
         with st.expander("View and Filter Active Groups", expanded=False):
@@ -901,6 +983,7 @@ def main():
                     st.session_state.styled_table_name_keywords = ""
                     st.session_state.styled_table_current_limit_value = 50
                     st.rerun()
+
                 # Filter the dataframe
                 active_df_for_styled_table = active_df_all_master.copy()
                 if st.session_state.styled_table_name_keywords:
@@ -924,6 +1007,7 @@ def main():
                 st.markdown('</div>', unsafe_allow_html=True) # Close filter-container
             else:
                 st.info("No active groups found yet to display here.")
+
         # Advanced Filtering for Downloads
         with st.expander("🔬 Advanced Filtering for Downloads & Analysis (Optional)", expanded=False):
             st.markdown('<div class="filter-container" style="border-style:solid;">', unsafe_allow_html=True)
@@ -940,6 +1024,7 @@ def main():
                 help="Applies to the entire dataset for download/analysis. Comma-separated."
             ).strip()
             st.markdown('</div>', unsafe_allow_html=True)
+
             df_for_adv_download_or_view = df_display_master.copy()
             adv_filters_applied = False
             if st.session_state.adv_filter_status:
@@ -960,6 +1045,7 @@ def main():
                 "Logo URL": st.column_config.LinkColumn("Logo URL", display_text="View", width="small"),
                 "Status": st.column_config.TextColumn("Status", width="small")
             }, hide_index=True, height=300, use_container_width=True)
+
         # Downloads
         st.subheader("📥 Download Results (CSV)")
         dl_col1, dl_col2 = st.columns(2)
